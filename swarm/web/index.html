@@ -50,7 +50,10 @@
     button { font: inherit; padding: 8px 16px; border-radius: 8px; border: 0; background: var(--accent); color: var(--card); font-weight: 600; cursor: pointer; }
     button:disabled { opacity: .5; cursor: default; }
     button.quiet { background: none; color: var(--accent); border: 1px solid var(--line); padding: 2px 10px; font-size: 13px; }
-    .head { display: flex; justify-content: space-between; align-items: baseline; }
+    .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+    .stats.bad { color: var(--bad); }
+    a { color: var(--accent); }
+    button.linkish { background: none; border: 0; padding: 0; color: var(--accent); font-size: inherit; font-weight: inherit; text-decoration: underline; }
     @media (max-width: 480px) { .blocks { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -71,12 +74,17 @@
   </section>
 
   <section class="card">
-    <div class="head"><h2>Ask the swarm</h2><button id="new" class="quiet" disabled>New chat</button></div>
+    <div class="head"><h2>Ask the swarm</h2><span><button id="peek" class="quiet">Peek at the database</button> <button id="new" class="quiet" disabled>New chat</button></span></div>
     <div id="chat"></div>
     <form id="form">
       <textarea id="input" rows="2" placeholder="Ask a question" disabled></textarea>
       <button id="send" disabled>Send</button>
     </form>
+  </section>
+
+  <section class="card" id="arkiv" hidden>
+    <div class="head"><h2>Open database · Arkiv</h2><a href="/arkiv" target="_blank" style="font-size:13px">full page</a></div>
+    <div id="arkiv-body"></div>
   </section>
 </main>
 <script type="module" src="app.js"></script>

@@ -14,20 +14,30 @@
 // browsers only allow Wake Lock and similar APIs on https:// pages.
 // --public-url is the address phones should open (a tunnel, say); the
 // dashboard shows it as a QR code.
+//
+// With ARKIV_PRIVATE_KEY in swarm/.env, every finished conversation and its
+// metrics are saved to Arkiv's Rabdi testnet (src/arkiv.js), and /arkiv shows
+// what is there.
 
 import { createHash } from "node:crypto";
 import { createReadStream, readdirSync, readFileSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { createServer as createTlsServer } from "node:https";
 import { networkInterfaces } from "node:os";
-import { dirname, extname, join, resolve, sep } from "node:path";
+import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import qrcode from "qrcode-generator";
 import { WebSocketServer } from "ws";
+import { createArkivStore, describeError } from "./src/arkiv.js";
 import { KIND, readHeader } from "./src/protocol.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+// swarm/.env holds the saver wallet's key; the environment wins over the file.
+try {
+  process.loadEnvFile(join(ROOT, "swarm", ".env"));
+} catch {}
 
 const { values: opts } = parseArgs({
   options: {
@@ -65,6 +75,18 @@ if (!statSync(join(resolve(opts.weights), "manifest.json"), { throwIfNoEntry: fa
 }
 const weightsVersion = versionOf(resolve(opts.weights));
 
+let arkiv = null;
+try {
+  arkiv = createArkivStore({
+    privateKey: process.env.ARKIV_PRIVATE_KEY?.trim() || null,
+    accessKey: process.env.ARKIV_ACCESS_KEY?.trim() ?? "",
+    model: basename(resolve(opts.weights)),
+  });
+} catch (err) {
+  console.error(`Arkiv is off: ${err.message}`);
+}
+const ARKIV_OFF = "Arkiv is off: set ARKIV_PRIVATE_KEY in swarm/.env and restart the tracker";
+
 // --- HTTP: the page, the code it imports, and the weights ---
 
 // URL prefix -> directory. The browser sees the same layout as the repo, so
@@ -80,7 +102,9 @@ const TYPES = { ".html": "text/html", ".js": "text/javascript", ".css": "text/cs
 function serveStatic(req, res) {
   const url = new URL(req.url, "http://x");
   const path = decodeURIComponent(url.pathname);
-  const redirects = { "/": "/swarm/web/", "/dashboard": "/swarm/web/dashboard.html", "/manage": "/swarm/web/manage.html" };
+  const redirects = {
+    "/": "/swarm/web/", "/dashboard": "/swarm/web/dashboard.html", "/manage": "/swarm/web/manage.html", "/arkiv": "/swarm/web/arkiv.html",
+  };
   if (redirects[path]) {
     res.writeHead(302, { location: redirects[path] });
     return res.end();
@@ -91,6 +115,14 @@ function serveStatic(req, res) {
     qr.make();
     res.writeHead(200, { "content-type": TYPES[".svg"], "cache-control": "no-cache" });
     return res.end(qr.createSvgTag({ cellSize: 8, margin: 2, scalable: true }));
+  }
+  if (path === "/arkiv/info") return sendJson(res, arkiv ? arkiv.info() : { enabled: false, reason: ARKIV_OFF });
+  if (path === "/arkiv/entities") {
+    if (!arkiv) return sendJson(res, { error: ARKIV_OFF }, 503);
+    return arkiv.list().then(
+      (list) => sendJson(res, list),
+      (err) => sendJson(res, { error: `reading from Arkiv failed: ${describeError(err)}` }, 502),
+    );
   }
   for (const [prefix, dir] of STATIC) {
     if (!path.startsWith(prefix)) continue;
@@ -113,6 +145,11 @@ function serveStatic(req, res) {
   res.end("not found\n");
 }
 
+function sendJson(res, body, status = 200) {
+  res.writeHead(status, { "content-type": TYPES[".json"], "cache-control": "no-cache" });
+  res.end(JSON.stringify(body));
+}
+
 // --- The swarm ---
 
 // id -> { id, ws, block, ready, sessions: Set, served, lastSeen, joinedAt,
@@ -120,9 +157,10 @@ function serveStatic(req, res) {
 //         rtt, pingAt, tokenMs, prefillMsPerToken, report, summary }
 const peers = new Map();
 // session id -> { asker, route: [peer ids], attempt, reroutes, context,
-//                 startAt, firstAt, lastAt, tokens, hopMs, hopN }
+//                 startAt, firstAt, lastAt, tokens, hopMs, hopN, recorded }
 const sessions = new Map();
 const watchers = new Set(); // dashboard sockets
+const chatOwners = new Map(); // Arkiv chat id -> id of the phone whose chat it is
 const events = [];          // the last log lines, for the dashboard
 let lanUrls = [];
 let joined = 0;
@@ -282,6 +320,7 @@ function fullState() {
       id, asker: s.asker, route: s.route, attempt: s.attempt, reroutes: s.reroutes, context: s.context, tokens: s.tokens,
     })),
     events,
+    arkiv: arkiv ? arkiv.info() : { enabled: false, reason: ARKIV_OFF },
   });
 }
 
@@ -331,8 +370,68 @@ function onControl(peer, msg) {
     endSession(msg.session, `failed: ${msg.message}`);
   } else if (msg.type === "stats") {
     peer.report = { ...msg.stats, at: Date.now() };
+  } else if (msg.type === "record") {
+    return record(peer, msg);
   }
   changed();
+}
+
+// The asker's answer finished: save the conversation and this answer's
+// metrics to Arkiv. The metrics are the tracker's own measurements; only a
+// session this phone asked, that produced tokens, is saved, once.
+function record(peer, msg) {
+  const s = sessions.get(msg.session);
+  const reply = (body) => send(peer, { type: "recorded", session: msg.session, chatId: msg.chatId, ...body });
+  if (!s || s.asker !== peer.id || s.recorded || !s.tokens) return;
+  s.recorded = true;
+  if (!arkiv) return reply({ skipped: ARKIV_OFF });
+  const messages = cleanMessages(msg.messages);
+  const chatId = typeof msg.chatId === "string" && /^[A-Za-z0-9-]{8,64}$/.test(msg.chatId) ? msg.chatId : null;
+  if (!chatId || !messages) return reply({ error: "bad record message" });
+  if ((chatOwners.get(chatId) ?? peer.id) !== peer.id) return reply({ error: "that chat belongs to another phone" });
+  chatOwners.set(chatId, peer.id);
+
+  const now = Date.now();
+  const num = (x) => (typeof x === "number" && Number.isFinite(x) ? Math.round(x) : null);
+  const metrics = {
+    turn: messages.filter((m) => m.role === "assistant").length,
+    session: msg.session,
+    at: new Date(now).toISOString(),
+    asker: peer.id,
+    route: [...s.route],
+    reroutes: s.reroutes,
+    finish: msg.finish === "length" ? "length" : "stop",
+    promptTokens: Math.max(0, s.context - s.tokens + 1),
+    tokens: s.tokens,
+    firstTokenMs: s.firstAt - s.startAt,
+    msPerToken: s.tokens > 1 ? num((s.lastAt - s.firstAt) / (s.tokens - 1)) : null,
+    tokensPerSec: s.tokens > 1 ? Number(((1000 * (s.tokens - 1)) / (s.lastAt - s.firstAt)).toFixed(2)) : null,
+    hopMs: s.route.map((_, i) => (s.hopN[i] ? num(s.hopMs[i] / s.hopN[i]) : null)),
+    askerFirstTokenMs: num(msg.asker?.firstTokenMs),
+    askerMsPerToken: num(msg.asker?.msPerToken),
+    phones: peers.size,
+  };
+  arkiv.save({ chatId, messages, metrics }).then(
+    (result) => {
+      log(`session ${msg.session} ${result.op === "create" ? "saved to" : "updated on"} Arkiv: entity ${short(result.entityKey)}, turn ${result.turns}, tx ${short(result.txHash)}`);
+      reply({ ...result });
+    },
+    (err) => {
+      const message = describeError(err);
+      log(`session ${msg.session}: saving to Arkiv failed: ${message}`);
+      reply({ error: message });
+    },
+  );
+}
+
+const short = (hex) => `${hex.slice(0, 8)}…${hex.slice(-4)}`;
+
+// [{ role, content }] with known roles and string contents, or null.
+function cleanMessages(messages) {
+  if (!Array.isArray(messages) || !messages.length || messages.length > 500) return null;
+  const roles = new Set(["system", "user", "assistant"]);
+  if (!messages.every((m) => roles.has(m?.role) && typeof m.content === "string")) return null;
+  return messages.map(({ role, content }) => ({ role, content }));
 }
 
 // Forward a frame to route[hop], or back to the asker after the last block.
@@ -472,4 +571,5 @@ server.listen(Number(opts.port), opts.host, () => {
   console.log(`  dashboard: ${scheme}://localhost:${port}/dashboard`);
   console.log(`  management: ${scheme}://localhost:${port}/manage`);
   console.log(`  blocks: ${blocks.map((b) => `[${b.start}, ${b.end})`).join(" ")}`);
+  console.log(arkiv ? `  arkiv: saving conversations as ${arkiv.address} on Rabdi, see ${scheme}://localhost:${port}/arkiv` : `  ${ARKIV_OFF}`);
 });

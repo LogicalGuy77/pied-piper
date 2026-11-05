@@ -6,3 +6,4 @@ testvectors-int8/
 node_modules/
 docker/certs/
 certs/
+.env

@@ -90,8 +90,10 @@ the reference answer through A → B → C.
 | `src/protocol.js` | Binary frame format |
 | `src/peer.js` | One phone: join, load its block, serve frames, ask. Same code in Node and in the browser |
 | `src/tokenizer.js` | Byte-level BPE and the chat template, no dependencies |
+| `src/arkiv.js` | Saves conversations and metrics to Arkiv (tracker only) |
 | `web/` | The phone: `index.html` and `app.js` for the UI, `worker.js` runs it in a Web Worker and caches its weights |
 | `web/dashboard.*`, `web/manage.*` | The laptop's demo screen and management view |
+| `web/arkiv.*` | The database peek, on the phone page and at `/arkiv` |
 | `test/check.js` | The checks |
 
 **Joining.** A tab says hello. The tracker gives it the block with the fewest
@@ -167,10 +169,45 @@ certificate. `--public-url` is the address the dashboard's QR code shows.
 **Ending.** On `<|im_end|>` or the token limit, the asker sends `end`, and the
 tracker tells every phone on the route to drop the session's KV cache.
 
+## Open database on Arkiv
+
+Every finished answer is saved to [Arkiv](https://docs.arkiv.network/)'s
+Rabdi testnet, where anyone can read it. To turn it on, put a testnet
+private key in `swarm/.env` (see `.env.example`), fund its address with tGLM
+at the [faucet](https://hub.arkiv.network/faucet), and restart the tracker:
+
+```sh
+ARKIV_PRIVATE_KEY=…     # the saver wallet (64 hex digits, 0x optional): pays for and owns every entity
+ARKIV_ACCESS_KEY=       # optional, lifts the public RPC's rate limit
+```
+
+Without a key the swarm runs as before and answers say "Arkiv is off".
+
+**What is saved.** One chat is one entity under the schema
+`pied-piper.conversation.v1`: the messages so far, and one metrics entry per
+answer (prompt and answer tokens, first token time, ms per token, tokens per
+second, the route, time per hop, reroutes, how it finished). The first answer
+of a chat creates the entity; each later answer patches it and pushes its
+expiry a day out, in one transaction. An entity expires a day after its last
+write. New chat starts a new entity.
+
+**How.** When `Peer.ask` sees the stop token (or the token limit), it sends
+`record` with the chat to the tracker, before ending the session. The tracker
+adds its own measurements of the session and writes the entity
+(`src/arkiv.js`); the private key never leaves the laptop. The asker gets
+`recorded` back, with the entity and transaction links, shown under the
+answer. Only the asker of a session that produced tokens can record it, once.
+
+**Peeking.** "Peek at the database" on the phone page, and `/arkiv` on the
+laptop, list the tracker's latest add and update transactions with explorer
+links, and the conversations read back from Arkiv itself, so an update shows
+up as a new block height, one more turn and a "just updated" mark.
+
 ## Wire format
 
 Control messages are small JSON: `hello`, `welcome`, `ready`, `ask`,
-`session`, `reroute`, `end`, `drop`, `fail`, `error`, `stats`, `swarm`, and
+`session`, `reroute`, `end`, `drop`, `fail`, `error`, `stats`, `swarm`,
+`record`/`recorded` for Arkiv, and
 `watch`/`state` for the dashboards.
 
 Data messages are binary, a 16-byte little-endian header and a raw payload:

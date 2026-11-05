@@ -24,7 +24,7 @@ import { Tokenizer } from "./tokenizer.js";
 
 export class Peer {
   // readFile(name) -> bytes of one file under the tracker's /weights/.
-  // onEvent(event) gets { type: "swarm" | "progress" | "served" | "reroute" | "closed", ... }.
+  // onEvent(event) gets { type: "swarm" | "progress" | "served" | "reroute" | "recorded" | "closed", ... }.
   // tap(frame) sees every binary frame this phone sends (tests).
   constructor({ server, readFile = null, onEvent = () => {}, tap = null }) {
     this.server = server.replace(/\/$/, "");
@@ -102,11 +102,18 @@ export class Peer {
 
   // Generates greedily through the swarm. Yields { token, session, route,
   // reroutes, ms } per new token, where ms is the round trip for that token.
-  async *ask(promptIds, { maxNew = 256, stopIds = [2] } = {}) {
+  //
+  // record: { chatId, messages } saves the conversation to Arkiv when the
+  // answer finishes: messages is the chat up to this question, and the
+  // tracker adds the answer's metrics and writes it (it holds the wallet).
+  // Needs loadTokenizer(), to turn the answer back into text.
+  async *ask(promptIds, { maxNew = 256, stopIds = [2], record = null } = {}) {
     const { session, route } = await this.request({ type: "ask" });
     const q = { attempt: 0, route, reroutes: 0, history: Array.from(promptIds), fed: 0, waiting: null, error: null };
     this.asking.set(session, q);
     const stop = new Set(stopIds);
+    const answer = [];
+    const timing = { firstMs: 0, restMs: 0 };
     try {
       for (let i = 0; i < maxNew; i++) {
         const t0 = performance.now();
@@ -115,8 +122,15 @@ export class Peer {
           q.waiting = { resolve, reject };
           this.feed(session, q);
         });
-        yield { token, session, route: q.route, reroutes: q.reroutes, ms: performance.now() - t0 };
-        if (stop.has(token)) break;
+        const ms = performance.now() - t0;
+        if (i === 0) timing.firstMs = ms;
+        else timing.restMs += ms;
+        const finish = stop.has(token) ? "stop" : i === maxNew - 1 ? "length" : null;
+        if (!stop.has(token)) answer.push(token);
+        // The answer is complete: save it now, before the session ends.
+        if (finish && record) this.record(session, record, answer, finish, timing);
+        yield { token, session, route: q.route, reroutes: q.reroutes, ms };
+        if (finish === "stop") break;
         q.history.push(token);
       }
     } finally {
@@ -131,6 +145,21 @@ export class Peer {
     const ids = Int32Array.from(q.history.slice(q.fed));
     this.sendFrame({ kind: KIND.TOKENS, hop: 0, attempt: q.attempt, session, pos: q.fed, n: ids.length }, ids);
     q.fed = q.history.length;
+  }
+
+  // Asks the tracker to save the finished conversation to Arkiv. The tracker
+  // answers with a "recorded" event: the entity, and the transaction's link.
+  record(session, { chatId, messages }, answer, finish, { firstMs, restMs }) {
+    if (!this.tokenizer || this.ws?.readyState !== WebSocket.OPEN) return;
+    const content = this.tokenizer.decode(answer, { skipSpecial: true });
+    this.send({
+      type: "record",
+      session,
+      chatId,
+      finish,
+      messages: [...messages, { role: "assistant", content }],
+      asker: { firstTokenMs: firstMs, msPerToken: answer.length > 1 ? restMs / (answer.length - 1) : null },
+    });
   }
 
   // What the phone reports to the tracker: anything the tracker can't measure itself.
@@ -200,7 +229,7 @@ export class Peer {
       if (q.waiting) this.feed(msg.session, q);
     } else if (msg.type === "drop") {
       this.drop(msg.session, msg.attempt);
-    } else if (msg.type === "swarm") {
+    } else if (msg.type === "swarm" || msg.type === "recorded") {
       this.onEvent(msg);
     }
   }
