@@ -1,0 +1,13 @@
+{
+  "name": "swarm-engine",
+  "private": true,
+  "type": "module",
+  "description": "Stage engine for phone swarm inference: runs a range of model layers in plain JS",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check": "node test/check.js",
+    "check:int8": "node test/check.js ../weights/smollm2-135m-instruct-int8 ../testvectors-int8"
+  }
+}

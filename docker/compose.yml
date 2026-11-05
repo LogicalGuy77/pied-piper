@@ -1,0 +1,26 @@
+# Mock swarm: one tracker container and N phone containers on one network.
+#   node docker/test.mjs          builds, starts, runs the scenarios, stops
+#   docker compose -f docker/compose.yml up --scale phone=6   to poke at it by hand
+name: phone-swarm
+
+services:
+  tracker:
+    build: ./tracker
+    volumes:
+      - ..:/app:ro
+    command: ["node", "swarm/tracker.js", "--port", "8443",
+              "--tls-cert", "docker/certs/tracker.crt", "--tls-key", "docker/certs/tracker.key"]
+    cap_add: [NET_ADMIN]   # for tc netem (Wi-Fi delay and loss)
+    ports:
+      - "8443:8443"        # open https://localhost:8443 on the host to watch
+
+  phone:
+    build: ./phone
+    init: true
+    cap_add: [NET_ADMIN]
+    cpus: ${PHONE_CPUS:-1}
+    mem_limit: ${PHONE_MEMORY:-1g}
+    shm_size: 256m
+    ports:
+      - "3000"             # Playwright browser server, on a random host port
+    depends_on: [tracker]

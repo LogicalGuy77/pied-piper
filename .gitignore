@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+weights/
+testvectors/
+testvectors-int8/
+node_modules/
+docker/certs/
+certs/
