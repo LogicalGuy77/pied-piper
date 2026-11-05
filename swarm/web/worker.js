@@ -66,12 +66,12 @@ async function start(server) {
   }
 }
 
-async function ask(messages, maxNew) {
+async function ask(messages, maxNew, chatId) {
   const tok = peer.tokenizer;
   const decoder = tok.streamDecoder();
   let tokens = 0, firstMs = 0, restMs = 0, reroutes = 0;
   try {
-    for await (const step of peer.ask(tok.chat(messages), { maxNew, stopIds: [tok.eosId] })) {
+    for await (const step of peer.ask(tok.chat(messages), { maxNew, stopIds: [tok.eosId], record: chatId ? { chatId, messages } : null })) {
       tokens++;
       reroutes = step.reroutes;
       if (tokens === 1) firstMs = step.ms;
@@ -87,6 +87,6 @@ async function ask(messages, maxNew) {
 
 self.onmessage = ({ data }) => {
   if (data.type === "start") start(data.server);
-  else if (data.type === "ask") ask(data.messages, data.maxNew);
+  else if (data.type === "ask") ask(data.messages, data.maxNew, data.chatId);
   else if (data.type === "stats") peer?.report(data.stats);
 };

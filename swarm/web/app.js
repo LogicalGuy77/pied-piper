@@ -13,6 +13,8 @@ let swarm = null;   // latest summary from the tracker
 let myRoute = null; // route of the question this phone is asking
 const messages = []; // the conversation so far, re-sent in full on each question
 let answerEl = null;
+let chatId = newChatId(); // this chat's entity on Arkiv; a new chat gets a new one
+let arkivPanel = null;    // the database peek, once opened
 
 const mb = (bytes) => `${(bytes / 1e6).toFixed(1)} MB`;
 const blockLabel = (b) => {
@@ -83,7 +85,8 @@ worker.onmessage = ({ data: e }) => {
     myRoute = e.route;
     renderSwarm();
   } else if (e.type === "token") {
-    answerEl.textContent += e.text;
+    if (e.session) answerEl.dataset.session = e.session;
+    answerEl.firstChild ? (answerEl.firstChild.textContent += e.text) : answerEl.append(e.text);
     if (e.route) {
       answerEl.dataset.route = e.route.join(" → ");
       myRoute = e.route;
@@ -91,13 +94,17 @@ worker.onmessage = ({ data: e }) => {
     }
     $("chat").scrollTop = $("chat").scrollHeight;
   } else if (e.type === "done") {
-    messages.push({ role: "assistant", content: answerEl.textContent });
+    messages.push({ role: "assistant", content: answerEl.firstChild?.textContent ?? "" });
     const stats = document.createElement("div");
     stats.className = "stats";
     const rerouted = e.reroutes ? ` · rerouted ${e.reroutes}× when a phone left` : "";
     stats.textContent = `route ${answerEl.dataset.route} · ${e.tokens} tokens · first token ${(e.firstMs / 1000).toFixed(1)} s · then ${e.msPerToken.toFixed(0)} ms per token${rerouted}`;
     answerEl.append(stats);
+    // The tracker saves the conversation to Arkiv; "recorded" says how it went.
+    if (!answerEl.querySelector(".arkiv")) answerEl.append(arkivLine("Saving this chat to Arkiv…"));
     finishAsk();
+  } else if (e.type === "recorded") {
+    showRecorded(e);
   } else if (e.type === "error") {
     messages.pop(); // the question didn't get an answer; don't keep it in the conversation
     answerEl.classList.add("error");
@@ -126,13 +133,15 @@ $("form").addEventListener("submit", (ev) => {
   answerEl = addMessage("assistant", "");
   busy = true;
   setInputEnabled();
-  worker.postMessage({ type: "ask", messages, maxNew: MAX_NEW });
+  worker.postMessage({ type: "ask", messages, maxNew: MAX_NEW, chatId });
 });
 
 // Each question re-sends the whole conversation, so long chats get slow to
 // start. A new chat starts from an empty one.
 $("new").addEventListener("click", () => {
   messages.length = 0;
+  chatId = newChatId();
+  arkivPanel?.setChat(chatId);
   $("chat").replaceChildren();
   setInputEnabled();
 });
@@ -143,6 +152,72 @@ $("input").addEventListener("keydown", (ev) => {
     $("form").requestSubmit();
   }
 });
+
+// --- Arkiv: each finished answer is saved to an open database ---
+
+function newChatId() {
+  const b = crypto.getRandomValues(new Uint8Array(16)); // randomUUID needs https
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+function arkivLine(text) {
+  const el = document.createElement("div");
+  el.className = "stats arkiv";
+  el.textContent = text;
+  return el;
+}
+
+function link(href, text) {
+  const a = document.createElement("a");
+  a.href = href;
+  a.target = "_blank";
+  a.rel = "noopener";
+  a.textContent = text;
+  return a;
+}
+
+const shortHex = (hex) => `${hex.slice(0, 8)}…${hex.slice(-4)}`;
+
+// The answer's line under it: created or updated, with links to the entity and the transaction.
+function showRecorded(e) {
+  const el = document.querySelector(`.msg.assistant[data-session="${e.session}"]`);
+  const line = el?.querySelector(".arkiv") ?? el?.appendChild(arkivLine(""));
+  if (line) {
+    line.replaceChildren();
+    if (e.skipped || e.error) {
+      line.classList.add("bad");
+      line.textContent = e.skipped ?? `Not saved to Arkiv: ${e.error.split("\n")[0]}`;
+    } else {
+      line.append(
+        `${e.op === "create" ? "Saved to" : "Updated on"} Arkiv (turn ${e.turns}) · entity `,
+        link(e.entityUrl, shortHex(e.entityKey)),
+        ` · ${e.op === "create" ? "create" : "update"} tx `,
+        link(e.txUrl, shortHex(e.txHash)),
+        " · ",
+      );
+      const peek = document.createElement("button");
+      peek.className = "linkish";
+      peek.textContent = "peek";
+      peek.addEventListener("click", () => openArkiv(true));
+      line.append(peek);
+    }
+  }
+  arkivPanel?.recorded(e);
+}
+
+async function openArkiv(show) {
+  $("arkiv").hidden = !show;
+  $("peek").textContent = show ? "Hide database" : "Peek at the database";
+  if (!show) return arkivPanel?.stop();
+  if (!arkivPanel) {
+    const { mountArkivPanel } = await import("./arkiv.js");
+    arkivPanel = mountArkivPanel($("arkiv-body"), { chatId });
+  } else {
+    arkivPanel.start();
+  }
+  $("arkiv").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+$("peek").addEventListener("click", () => openArkiv($("arkiv").hidden));
 
 // --- Staying awake ---
 // A phone whose screen turns off stops answering and is dropped. The lock

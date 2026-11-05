@@ -13,7 +13,9 @@
     "check:float32": "node test/check.js ../weights/smollm2-135m-instruct ../testvectors"
   },
   "dependencies": {
+    "@arkiv-network/sdk": "^1.0.1",
     "qrcode-generator": "^1.4.4",
+    "viem": "^2.57.16",
     "ws": "8.22.1"
   }
 }
