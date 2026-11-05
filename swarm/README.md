@@ -1,0 +1,197 @@
+# Step 3: Swarm in browser tabs
+
+The laptop runs a tracker. Each browser tab is a phone: it gets a block from
+the tracker, downloads only that block's weights, serves it for everyone, and
+can ask questions itself. Every hop goes through the tracker over WebSocket
+(star topology).
+
+## Run
+
+Needs Node 22+ and the outputs of step 1 (`weights/` and `testvectors/`):
+
+```sh
+.venv/bin/python reference/tokenizer_vectors.py   # once: tokenizer ids for the checks
+cd swarm && npm install
+npm run check      # 28 checks, about 1.5 min
+npm start          # tracker on http://localhost:8080
+```
+
+Then open `http://localhost:8080` in three or more tabs. The first three tabs
+get blocks 1, 2 and 3. Ask a question in any tab. The answer to "Explain in
+two sentences why the sky is blue." should start with the same text as
+`reference/chat.py`.
+
+On the laptop, `/dashboard` is the demo screen: a QR code for joining, every
+phone under its block, the questions in flight and the tracker's log.
+`/manage` shows throughput and utilization for the swarm, each block and
+each phone.
+
+### Real phones
+
+Phones need an `https://` page. Two ways that work:
+
+- **Cloudflare quick tunnel**, any network, a real certificate:
+  ```sh
+  cloudflared tunnel --url https://localhost:8443 --no-tls-verify   # prints https://….trycloudflare.com
+  node tracker.js --port 8443 --tls-cert ../certs/lan.crt --tls-key ../certs/lan.key \
+    --public-url https://….trycloudflare.com
+  ```
+  The laptop needs a fast uplink: each phone downloads its 200 MB block
+  through it once. Over venue Wi-Fi (0.6 MB/s) that took half an hour; over
+  Ethernet, 20 seconds. The address changes every time cloudflared restarts.
+- **Same network**, faster: a self-signed certificate for the laptop's IP
+  (`openssl req -x509 … -addext "subjectAltName=IP:<laptop IP>"`), accepted
+  once on each phone. Phone hotspots and venue Wi-Fi often block devices
+  from reaching each other; the laptop's own hotspot works. Under WSL, the
+  port also needs forwarding from Windows
+  (`netsh interface portproxy add v4tov4 listenport=8443 connectaddress=<WSL IP> connectport=8443`).
+
+## What the checks prove
+
+The checks start the real tracker and run six phones in one Node process.
+The phones fetch weights over HTTP and talk only through the tracker's
+WebSocket, the same path a tab uses.
+
+| Check | Result on this laptop |
+|---|---|
+| Tokenizer gives Hugging Face's ids on 25 tricky strings and 3 chats, and decodes back | yes, including emoji, Hindi, Chinese, code and special tokens |
+| Frames survive encode/decode bit for bit | yes, 2,320 bytes per hop per new token |
+| Asking before every block has a holder | clear "waiting for block 2" error |
+| Six phones split two per block | A,D · B,E · C,F |
+| **Greedy answer through the swarm equals Hugging Face's** | 40 of 40 |
+| Every h sent between phones is bit-identical to step 2's in-process run | 80 of 80 frames |
+| Two askers at once get disjoint routes and their solo answers | A → B → C and D → E → F |
+| **A phone leaving mid-answer** | rerouted to A → E → C; all 30 tokens still equal Hugging Face's |
+| The last holder of a block leaving mid-answer | clear error: "no other phone has block 2 ready" |
+| Sessions end | every phone has freed every KV cache |
+| A phone silent for 12 s while it owes a reply | kept, and its answer is right |
+| The same phone silent while idle | dropped after the 8 s heartbeat timeout |
+| What phones get | a 228-byte summary, only when it changes |
+| What the dashboard gets | every phone's ping and time per token, throughput, a log line per answer, a QR code |
+
+Planted bugs that the checks catch: routing that ignores load, the tracker
+forgetting to tell phones to drop a session, and a tokenizer without the
+contraction rule (`'s`, `'ll`, …).
+
+A headless Chromium run also passed: four tabs joined, and the asking tab got
+the reference answer through A → B → C.
+
+## How it fits together
+
+| File | Role |
+|---|---|
+| `tracker.js` | HTTP for the pages, code, weights and `/qr.svg`; WebSocket at `/ws` for the swarm and the dashboards |
+| `src/protocol.js` | Binary frame format |
+| `src/peer.js` | One phone: join, load its block, serve frames, ask. Same code in Node and in the browser |
+| `src/tokenizer.js` | Byte-level BPE and the chat template, no dependencies |
+| `web/` | The phone: `index.html` and `app.js` for the UI, `worker.js` runs it in a Web Worker and caches its weights |
+| `web/dashboard.*`, `web/manage.*` | The laptop's demo screen and management view |
+| `test/check.js` | The checks |
+
+**Joining.** A tab says hello. The tracker gives it the block with the fewest
+holders, and the tab downloads that block's weights from `/weights/`. When
+loaded, it tells the tracker it is ready. Only ready phones get routed to.
+
+**Asking.** The asker asks the tracker for a session. The tracker picks the
+ready holder of each block with the fewest active sessions, and the route
+stays fixed for the whole answer because each phone on it keeps the session's
+KV cache. Then, for every token:
+
+```
+asker ──TOKENS hop 0──▶ tracker ──▶ block 1 ──HIDDEN hop 1──▶ tracker ──▶ block 2
+      ──HIDDEN hop 2──▶ tracker ──▶ block 3 ──NEXT hop 3──▶ tracker ──▶ asker
+```
+
+The first pass sends the whole prompt; after that only the one new token. A
+phone never needs to know the route: it runs its block and sends the result
+with `hop + 1`, and the tracker forwards it to `route[hop]`, or to the asker
+after the last block. The tracker only forwards a frame from the phone that
+should be sending that hop.
+
+**Serving.** Frames for a phone wait in a queue and run one at a time. The
+phone pauses after every layer (`Stage.forwardAsync`), so it keeps reading
+its socket while it computes. On real phones, three questions arriving at
+once used to hold the phone long enough that Chrome stopped reading the
+socket, missed the tracker's pings, and the phone was dropped.
+
+**Heartbeat.** The tracker pings every phone each second. A phone that sends
+nothing for 5 s, not even a pong, is dropped (`--heartbeat-timeout`). A
+locked phone keeps its connection open, so waiting for a close event alone
+would hang the asker forever. A phone that owes a reply gets 20 s instead
+(`--busy-timeout`): a long prefill is not a phone gone. The cost is that a
+phone freezing mid-computation takes up to 20 s to notice.
+
+**Staying awake.** The page holds a screen wake lock while it is visible and
+takes it again when the phone comes back to it. A phone that switches apps
+is still frozen by the browser and dropped.
+
+**Weight cache.** The worker keeps the block's weights in the Cache API,
+under a version the tracker computes from the weight files' sizes and
+dates. A reload or a rejoin reads them from disk: 1 s instead of a download.
+It needs an `https://` page; Chrome allows it with an accepted self-signed
+certificate too.
+
+**Rerouting.** If a phone on the route leaves mid-answer, the tracker picks
+another ready holder of its block, bumps the session's attempt and sends the
+asker `reroute`. Every phone on the route drops the old attempt's KV cache;
+the asker replays the prompt and every token so far as one prefill under the
+new attempt, and keeps waiting for the same next token. Frames from the old
+attempt are ignored, by the tracker and by the phones. If no other phone has
+the block ready, or the session was rerouted 5 times, the asker gets an error.
+
+**Measuring.** The tracker times each phone's pong (ping), and each frame
+from forwarding it to a phone until the phone's answer comes back (hop time:
+compute plus network). Phones report only what the tracker can't see:
+compute time, battery, whether the page is in the background, wake lock and
+the device. Every finished answer gets a log line with its speed per hop:
+
+```
+session 1 done: 40 tokens, first token 5.0 s, then 165 ms per token · per hop A 35 ms, B 61 ms, C 69 ms
+```
+
+**What goes where.** Phones get a small summary (holders per block, phones,
+questions in flight), only when it changes. The dashboards send `watch` and
+get the full state every second. Sending every phone the full phone list on
+every token, as before, grows with the square of the number of phones.
+
+**HTTPS.** `--tls-cert FILE --tls-key FILE` serves HTTPS and WSS, which phones
+on the LAN need. [docker/](../docker/README.md) uses it with a self-signed
+certificate. `--public-url` is the address the dashboard's QR code shows.
+
+**Ending.** On `<|im_end|>` or the token limit, the asker sends `end`, and the
+tracker tells every phone on the route to drop the session's KV cache.
+
+## Wire format
+
+Control messages are small JSON: `hello`, `welcome`, `ready`, `ask`,
+`session`, `reroute`, `end`, `drop`, `fail`, `error`, `stats`, `swarm`, and
+`watch`/`state` for the dashboards.
+
+Data messages are binary, a 16-byte little-endian header and a raw payload:
+
+| Bytes | Field | |
+|---|---|---|
+| 0 | kind | 1 TOKENS, 2 HIDDEN, 3 NEXT |
+| 1 | hop | index of the receiver in the route |
+| 2–3 | attempt | bumped on each reroute; older attempts are ignored |
+| 4–7 | session | from the tracker |
+| 8–11 | pos | position of the first token |
+| 12–15 | n | number of tokens |
+| 16– | payload | int32 token ids, or float32 h (n × 576) |
+
+## Speed
+
+On this laptop: about 4.8 s for the first token of a 40-token prompt, then
+about 160 ms per token. That is step 2's compute plus a few ms of relay over
+localhost. Phones on Wi-Fi will be slower; step 4 (WASM SIMD, int8 weights)
+is where speed gets fixed.
+
+## Not yet
+
+- Rebalancing: moving a phone to a block that has lost its holders. New
+  phones fill the emptiest block, but nothing moves a phone that has joined.
+- Faster kernels and int8 weights (step 4), credits (step 5).
+- Direct phone-to-phone WebRTC (after the MVP).
+- Each question re-sends the whole conversation as a new session, so long
+  chats get slow to start (about 0.13 s per prompt token). The page has a New
+  chat button; keeping the KV cache across turns is the real fix.
