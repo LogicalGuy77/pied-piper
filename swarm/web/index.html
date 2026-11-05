@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Phone Swarm</title>
+  <style>
+    :root {
+      --bg: #f6f7f9; --card: #ffffff; --text: #16212b; --muted: #5d6b78; --line: #dde2e7;
+      --b1: #d6eef0; --b1s: #0b7a85; --b2: #e3e0f7; --b2s: #5847c2; --b3: #f5e1d3; --b3s: #b4541a;
+      --accent: #0b7a85; --bad: #c2352e;
+      color-scheme: light;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #11161b; --card: #1a2128; --text: #e6ebf0; --muted: #94a2af; --line: #2c3640;
+        --b1: #15393d; --b1s: #4fc3cd; --b2: #2a2550; --b2s: #9d90f0; --b3: #452a1a; --b3s: #f0995e;
+        --accent: #4fc3cd; --bad: #ff7b72;
+        color-scheme: dark;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, sans-serif; }
+    main { max-width: 760px; margin: 0 auto; padding: 16px; display: grid; gap: 14px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 10px; }
+    .muted { color: var(--muted); }
+    .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 8px; }
+    .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+    .blocks { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .block { border-radius: 10px; padding: 8px; border: 1px solid; min-height: 72px; }
+    .block[data-b="0"] { background: var(--b1); border-color: var(--b1s); }
+    .block[data-b="1"] { background: var(--b2); border-color: var(--b2s); }
+    .block[data-b="2"] { background: var(--b3); border-color: var(--b3s); }
+    .block .name { font-size: 12px; font-weight: 600; }
+    .block .count { font: 12px ui-monospace, monospace; margin-top: 6px; }
+    .block .warn { font-size: 12px; color: var(--bad); }
+    .note { font-size: 12px; color: var(--muted); margin-top: 8px; }
+    .note:empty { display: none; }
+    #routes { margin-top: 10px; font: 12px ui-monospace, monospace; color: var(--muted); }
+    #chat { display: grid; gap: 8px; max-height: 50vh; overflow-y: auto; }
+    .msg { padding: 8px 12px; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .msg.user { background: var(--b1); justify-self: end; max-width: 85%; }
+    .msg.assistant { background: var(--bg); border: 1px solid var(--line); max-width: 95%; }
+    .msg.error { color: var(--bad); }
+    .stats { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    form { display: flex; gap: 8px; margin-top: 10px; }
+    textarea { flex: 1; resize: none; font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+    button { font: inherit; padding: 8px 16px; border-radius: 8px; border: 0; background: var(--accent); color: var(--card); font-weight: 600; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: default; }
+    button.quiet { background: none; color: var(--accent); border: 1px solid var(--line); padding: 2px 10px; font-size: 13px; }
+    .head { display: flex; justify-content: space-between; align-items: baseline; }
+    @media (max-width: 480px) { .blocks { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <section class="card">
+    <h1 id="title">Joining the swarm…</h1>
+    <div id="status" class="muted">Connecting to the tracker</div>
+    <div class="bar"><div id="progress"></div></div>
+    <div id="awake" class="note"></div>
+  </section>
+
+  <section class="card">
+    <h2>Swarm</h2>
+    <div class="blocks" id="blocks"></div>
+    <div id="routes"></div>
+    <div id="mine" class="note"></div>
+  </section>
+
+  <section class="card">
+    <div class="head"><h2>Ask the swarm</h2><button id="new" class="quiet" disabled>New chat</button></div>
+    <div id="chat"></div>
+    <form id="form">
+      <textarea id="input" rows="2" placeholder="Ask a question" disabled></textarea>
+      <button id="send" disabled>Send</button>
+    </form>
+  </section>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>

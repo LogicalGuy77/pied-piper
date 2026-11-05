@@ -7,19 +7,25 @@ can ask questions itself. Every hop goes through the tracker over WebSocket
 
 ## Run
 
-Needs Node 22+ and the outputs of step 1 (`weights/` and `testvectors/`):
+Needs Node 22+ and the outputs of step 1. The tracker serves the int8 export
+by default (about 55 MB per block instead of 200):
 
 ```sh
 .venv/bin/python reference/tokenizer_vectors.py   # once: tokenizer ids for the checks
+.venv/bin/python reference/export.py --dtype int8 # once: weights/smollm2-135m-instruct-int8/
+.venv/bin/python reference/check_int8.py          # once: testvectors-int8/
 cd swarm && npm install
-npm run check      # 28 checks, about 1.5 min
-npm start          # tracker on http://localhost:8080
+npm run check          # 28 checks on int8, about 1.5 min
+npm run check:float32  # the same checks on float32, against Hugging Face's answer
+npm start              # tracker on http://localhost:8080, int8
+npm run start:float32  # the same, serving float32
 ```
 
 Then open `http://localhost:8080` in three or more tabs. The first three tabs
 get blocks 1, 2 and 3. Ask a question in any tab. The answer to "Explain in
 two sentences why the sky is blue." should start with the same text as
-`reference/chat.py`.
+`reference/chat.py --weights weights/smollm2-135m-instruct-int8` (plain
+`reference/chat.py` under `npm run start:float32`).
 
 On the laptop, `/dashboard` is the demo screen: a QR code for joining, every
 phone under its block, the questions in flight and the tracker's log.

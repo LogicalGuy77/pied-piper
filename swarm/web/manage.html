@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Phone Swarm · Management</title>
+  <style>
+    :root {
+      --bg: #f6f7f9; --card: #ffffff; --text: #16212b; --muted: #5d6b78; --line: #dde2e7;
+      --b1s: #0b7a85; --b2s: #5847c2; --b3s: #b4541a; --accent: #0b7a85; --bad: #c2352e; --warn: #b07d00;
+      color-scheme: light;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #11161b; --card: #1a2128; --text: #e6ebf0; --muted: #94a2af; --line: #2c3640;
+        --b1s: #4fc3cd; --b2s: #9d90f0; --b3s: #f0995e; --accent: #4fc3cd; --bad: #ff7b72; --warn: #e3b341;
+        color-scheme: dark;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, sans-serif; }
+    main { padding: 16px; display: grid; gap: 14px; max-width: 1400px; margin: 0 auto; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; overflow-x: auto; }
+    header { display: flex; justify-content: space-between; align-items: baseline; }
+    h1 { font-size: 20px; margin: 0; }
+    h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 10px; }
+    a { color: var(--accent); }
+    .muted { color: var(--muted); }
+    .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+    .tile { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+    .tile b { font-size: 24px; display: block; font-variant-numeric: tabular-nums; }
+    .tile .muted { font-size: 12px; }
+    table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+    th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+    th { font-size: 12px; font-weight: 600; color: var(--muted); }
+    th:first-child, td:first-child, th.l, td.l { text-align: left; }
+    tr.b0 td:first-child { border-left: 4px solid var(--b1s); }
+    tr.b1 td:first-child { border-left: 4px solid var(--b2s); }
+    tr.b2 td:first-child { border-left: 4px solid var(--b3s); }
+    .util { display: inline-block; width: 70px; height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; vertical-align: middle; margin-left: 6px; }
+    .util > i { display: block; height: 100%; background: var(--accent); }
+    .util.hot > i { background: var(--bad); }
+    .bad { color: var(--bad); }
+    .warn { color: var(--warn); }
+    .note { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Swarm management</h1>
+    <span><span id="conn" class="muted"></span> · <a href="dashboard.html">Demo dashboard</a></span>
+  </header>
+
+  <section class="card">
+    <h2>Swarm throughput</h2>
+    <div class="tiles" id="tiles"></div>
+    <div class="note">Answer tokens are the tokens askers receive. Served tokens are tokens any phone ran its block on,
+      prompt tokens included, so every answer token counts once per block. Rates are over the last minute.</div>
+  </section>
+
+  <section class="card">
+    <h2>Blocks</h2>
+    <table id="blocks"></table>
+    <div class="note">Capacity is how many generated tokens per second the block's phones could run if they did
+      nothing else: the sum of 1000 ÷ compute ms per token. The block with the least capacity limits the swarm.</div>
+  </section>
+
+  <section class="card">
+    <h2>Phones</h2>
+    <table id="phones"></table>
+    <div class="note">Utilization is the share of the last minute the phone spent computing, from the compute time it
+      reports. Hop time is measured by the tracker, from forwarding a frame to the phone until its answer comes back,
+      so it includes the network; network = hop time − compute.</div>
+  </section>
+</main>
+<script type="module" src="manage.js"></script>
+</body>
+</html>

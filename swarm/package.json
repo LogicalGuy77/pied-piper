@@ -8,7 +8,9 @@
   },
   "scripts": {
     "start": "node tracker.js",
-    "check": "node test/check.js"
+    "start:float32": "node tracker.js --weights ../weights/smollm2-135m-instruct",
+    "check": "node test/check.js",
+    "check:float32": "node test/check.js ../weights/smollm2-135m-instruct ../testvectors"
   },
   "dependencies": {
     "qrcode-generator": "^1.4.4",
