@@ -7,7 +7,12 @@
     "node": ">=20"
   },
   "scripts": {
+    "build:wasm": "node scripts/build-wasm.mjs",
     "check": "node test/check.js",
+    "check:js": "KERNELS=js node test/check.js",
     "check:int8": "node test/check.js ../weights/smollm2-135m-instruct-int8 ../testvectors-int8"
+  },
+  "devDependencies": {
+    "wabt": "^1.0.37"
   }
 }

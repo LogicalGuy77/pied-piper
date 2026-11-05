@@ -75,7 +75,8 @@ worker.onmessage = ({ data: e }) => {
     $("status").textContent = `Loading block weights: ${mb(e.loaded)} of ${mb(e.total)}`;
   } else if (e.type === "loaded") {
     const cached = e.fromCache >= e.weightBytes ? ", from this phone's cache" : "";
-    $("status").textContent = `Serving ${e.describe} (${mb(e.weightBytes)}${cached}). You can ask too.`;
+    const kernels = e.kernels === "wasm" ? "WASM SIMD" : "plain JS";
+    $("status").textContent = `Serving ${e.describe} (${mb(e.weightBytes)}${cached}, ${kernels}). You can ask too.`;
   } else if (e.type === "swarm") {
     swarm = e;
     renderSwarm();

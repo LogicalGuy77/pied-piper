@@ -8,8 +8,7 @@
 //   cd docker && npm install && npm test
 //   PHONES=9 WIFI="delay 8ms 4ms loss 1%" KEEP=1 npm test
 //
-// Needs the int8 weights and testvectors-int8/ (reference/export.py --dtype int8,
-// reference/check_int8.py) and swarm/node_modules. The tracker serves int8 by default.
+// Needs weights/, testvectors/ and swarm/node_modules from steps 1-3.
 
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -23,7 +22,7 @@ const PHONES = Number(process.env.PHONES ?? 6);
 const WIFI = process.env.WIFI ?? "delay 8ms 4ms loss 1%"; // netem per link: delay, jitter, loss
 const SLOW_CPUS = process.env.SLOW_CPUS ?? "0.5";
 const URL_IN_SWARM = "https://tracker:8443/";
-const index = JSON.parse(readFileSync(join(ROOT, "testvectors-int8", "index.json"), "utf8"));
+const index = JSON.parse(readFileSync(join(ROOT, "testvectors", "index.json"), "utf8"));
 
 const results = [];
 function check(name, ok, detail = "") {
@@ -37,8 +36,8 @@ const secs = (ms) => `${(ms / 1000).toFixed(1)} s`;
 
 // --- Bring the swarm up ---
 
-for (const need of ["weights/smollm2-135m-instruct-int8/manifest.json", "testvectors-int8/index.json", "swarm/node_modules/ws"]) {
-  if (!existsSync(join(ROOT, need))) throw new Error(`missing ${need}: run steps 1-3 and the int8 export first (see README.md)`);
+for (const need of ["weights/smollm2-135m-instruct/manifest.json", "testvectors/index.json", "swarm/node_modules/ws"]) {
+  if (!existsSync(join(ROOT, need))) throw new Error(`missing ${need}: run steps 1-3 first (see README.md)`);
 }
 const certs = join(HERE, "certs");
 if (!existsSync(join(certs, "tracker.crt"))) {
@@ -148,7 +147,7 @@ try {
 
   console.log("2. One answer over the network");
   const base = await ask(asker, index.prompt);
-  check("the answer starts with the reference's greedy text", !base.error && base.text.startsWith(index.greedy_text), speed(base));
+  check("the answer starts with Hugging Face's greedy text", !base.error && base.text.startsWith(index.greedy_text), speed(base));
 
   console.log(`3. Wi-Fi: every link gets netem "${WIFI}"`);
   for (const p of phones) netem(p.container, WIFI);

@@ -7,7 +7,8 @@
 // 5. Other splits, and one-token-at-a-time prefill, are bit-identical to it.
 // 6. Interleaved sessions on shared stages don't affect each other.
 //
-//   cd engine && npm run check
+//   cd engine && npm run check        # WASM SIMD kernels
+//   cd engine && npm run check:js     # the plain JS kernels
 //   cd engine && npm run check:int8   # the int8 export against testvectors-int8/
 
 import { join } from "node:path";
@@ -65,7 +66,7 @@ function compareTrace(trace, reference, rowLength) {
 }
 
 const t0 = performance.now();
-const weights = await openWeights(WEIGHTS);
+const weights = { ...(await openWeights(WEIGHTS)), kernels: process.env.KERNELS ?? "wasm" };
 const { manifest } = weights;
 const { index, arrays } = await openTestVectors(VECTORS);
 const L = manifest.config.num_layers;
@@ -110,8 +111,14 @@ const arch = [0, 8, L - 8, L];
 console.log(`\n4. Greedy generation through the 3-block split ${fmt(arch)}`);
 const archPipe = await Pipeline.load({ ...weights, boundaries: arch });
 const tGen = performance.now();
-const base = generate(archPipe, "s", prompt, expected.length, stopIds);
+let firstMs = 0;
+const steps0 = [];
+for (const step of generateStream(archPipe, "s", prompt, expected.length, stopIds)) {
+  firstMs ||= performance.now() - tGen;
+  steps0.push(step);
+}
 const genMs = performance.now() - tGen;
+const base = { tokens: steps0.map((s) => s.token), logits: steps0.map((s) => s.logits) };
 check(`tokens identical to the Python reference${manifest.dtype === "int8" ? " (int8)" : " (and Hugging Face)"}`,
   sameTokens(base.tokens, expected), `${expected.length} tokens`);
 console.log(`        answer: ${JSON.stringify(index.greedy_text)}`);
@@ -158,10 +165,15 @@ let rejected = false;
 try { shared.forward("b", [1], 0); } catch { rejected = true; }
 check("a token at the wrong position is rejected", rejected);
 
-console.log("\nSpeed on this machine (plain JS, one thread)");
+console.log(`\n7. Kernels`);
+check(`every stage runs on the ${weights.kernels === "js" ? "plain JS" : "WASM SIMD"} kernels`,
+  archPipe.stages.every((s) => s.kernels === (weights.kernels === "js" ? "js" : "wasm")));
+
+console.log(`\nSpeed on this machine (${archPipe.stages[0].kernels === "wasm" ? "WASM SIMD" : "plain JS"}, one thread)`);
 const decodeMs = archPipe.ms.map((ms) => ms);
 const totalMs = decodeMs.reduce((x, y) => x + y, 0);
-console.log(`  ${expected.length} tokens in ${(genMs / 1000).toFixed(1)} s, including the ${prompt.length}-token prompt`);
+console.log(`  ${expected.length} tokens in ${(genMs / 1000).toFixed(1)} s: first token ${(firstMs / 1000).toFixed(2)} s ` +
+  `(the ${prompt.length}-token prompt), then ${((genMs - firstMs) / (expected.length - 1)).toFixed(0)} ms per token`);
 archPipe.stages.forEach((s, i) => {
   console.log(`  stage ${i + 1}  ${s.describe().padEnd(26)} ${(s.weightBytes / 1e6).toFixed(1).padStart(6)} MB  ` +
     `${((decodeMs[i] / totalMs) * 100).toFixed(0).padStart(3)}% of compute`);

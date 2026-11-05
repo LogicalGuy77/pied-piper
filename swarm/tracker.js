@@ -7,9 +7,6 @@
 //                         [--tls-cert FILE --tls-key FILE] [--public-url URL]
 //                         [--heartbeat-timeout 5000] [--busy-timeout 20000]
 //
-// --weights defaults to the int8 export (a quarter of the download); pass
-// weights/smollm2-135m-instruct for float32, Hugging Face's exact answers.
-//
 // With a certificate it serves HTTPS and WSS, which phones on the LAN need:
 // browsers only allow Wake Lock and similar APIs on https:// pages.
 // --public-url is the address phones should open (a tunnel, say); the
@@ -43,7 +40,7 @@ const { values: opts } = parseArgs({
   options: {
     port: { type: "string", default: "8080" },
     host: { type: "string", default: "0.0.0.0" },
-    weights: { type: "string", default: join(ROOT, "weights", "smollm2-135m-instruct-int8") },
+    weights: { type: "string", default: join(ROOT, "weights", "smollm2-135m-instruct") },
     blocks: { type: "string", default: "0,8,22,30" },
     "tls-cert": { type: "string" },
     "tls-key": { type: "string" },
@@ -69,8 +66,7 @@ function versionOf(dir) {
   return hash.digest("hex").slice(0, 12);
 }
 if (!statSync(join(resolve(opts.weights), "manifest.json"), { throwIfNoEntry: false })) {
-  console.error(`No weights in ${opts.weights}. Export them first:\n` +
-    "  .venv/bin/python reference/export.py --dtype int8   (or --weights a float32 export)");
+  console.error(`No weights in ${opts.weights}. Export them first:\n  .venv/bin/python reference/export.py`);
   process.exit(1);
 }
 const weightsVersion = versionOf(resolve(opts.weights));

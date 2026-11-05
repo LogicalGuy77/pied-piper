@@ -1,15 +1,18 @@
 // Math kernels for one transformer layer, in plain JS on Float32Array.
-// Step 4 replaces this file with WASM SIMD versions behind the same functions.
+// The matmuls, nearly all of the compute, also run in WASM SIMD (wasm.js)
+// when a stage's matrices live in a wasm arena.
 //
 // Layout everywhere: row-major. A batch of n vectors of width d is one
 // Float32Array of length n * d, vector t at offset t * d.
 
-// A weight matrix is a Float32Array, or { q: Int8Array, scale: Float32Array }
-// for int8 with one scale per row: W[o][i] = q[o * in + i] * scale[o].
+// A weight matrix is a Float32Array, { q: Int8Array, scale: Float32Array }
+// for int8 with one scale per row (W[o][i] = q[o * in + i] * scale[o]), or a
+// handle into a wasm arena ({ arena, ... }, from WasmArena.matrix).
 
 // y[n, out] = x[n, in] @ W[out, in]^T, one dot product per (token, row).
 // Rows of W are the outer loop so each row stays in cache across the n tokens.
 export function matmul(x, W, n, inDim, outDim) {
+  if (W.arena) return W.arena.matmul(x, W, n, inDim, outDim);
   if (!(W instanceof Float32Array)) return matmulInt8(x, W.q, W.scale, n, inDim, outDim);
   const y = new Float32Array(n * outDim);
   for (let o = 0; o < outDim; o++) {
@@ -56,6 +59,7 @@ function matmulInt8(x, q, scale, n, inDim, outDim) {
 
 // Row r of a weight matrix as float32 values, written into out at offset.
 export function copyRow(W, r, d, out, offset) {
+  if (W.arena) return W.arena.copyRow(W, r, out, offset);
   if (W instanceof Float32Array) return out.set(W.subarray(r * d, (r + 1) * d), offset);
   const s = W.scale[r];
   for (let i = 0; i < d; i++) out[offset + i] = W.q[r * d + i] * s;

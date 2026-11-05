@@ -190,10 +190,10 @@ ETHGlobal piece.
 | Step | What | Status |
 |---|---|---|
 | 1 | **Python reference.** Export the weights as blocks, write a NumPy stage engine, and prove that split runs give exactly the same tokens as the unsplit model. | Done: 17/17 checks. Matches Hugging Face, and every split is bit-identical. [reference/](reference/README.md) |
-| 2 | **JS engine in Node.** Port the stage to JavaScript and check it against step 1's test vectors. | Done: 15/15 checks. Matches Python to about 1e-6, 130 ms per token on a laptop. [engine/](engine/README.md) |
+| 2 | **JS engine in Node.** Port the stage to JavaScript and check it against step 1's test vectors. | Done: 16/16 checks. Matches Python to about 1e-6, 30 ms per token on a laptop with the WASM kernels (130 ms in plain JS). [engine/](engine/README.md) |
 | 3 | **Swarm in browser tabs.** Tracker, routes and sessions, with several tabs on one laptop standing in for phones. The output must match Hugging Face token for token. | Done: 21/21 checks. 40 of 40 tokens through the swarm, and h on the wire is bit-identical to step 2. [swarm/](swarm/README.md) |
 | 3.5 | **Mock phones as containers.** Each phone is a Docker container running Chromium, behind HTTPS, with Wi-Fi delay and loss, frozen phones, killed phones and slow phones. | Done: 16/16 scenarios. Wi-Fi adds about 70 ms per token; a frozen phone is dropped after 5 s. [docker/](docker/README.md) |
-| 4 | **Real phones.** HTTPS, screen wake lock, weights cached in the browser, phones that stay reachable while they compute, then faster WASM kernels with int8 weights. | Real phones answered over a Cloudflare tunnel and on the LAN. Wake lock, weight cache and busy-aware heartbeat done: 28/28 swarm checks, 17/17 container checks. int8 weights done (a quarter of the download, see below). WASM kernels next. [swarm/](swarm/README.md#real-phones) |
+| 4 | **Real phones.** HTTPS, screen wake lock, weights cached in the browser, phones that stay reachable while they compute, then faster WASM kernels with int8 weights. | Real phones answered over a Cloudflare tunnel and on the LAN. Wake lock, weight cache and busy-aware heartbeat done: 28/28 swarm checks, 17/17 container checks. WASM SIMD matmul kernels done: 4× faster per token, 12× faster on the prompt. [engine/](engine/README.md#speed) [swarm/](swarm/README.md#real-phones) |
 | 5 | **Credits, recovery, dashboard.** Credit balances, rerouting when a phone leaves, rebalancing blocks, and a live view of the swarm. | Rerouting, the dashboard (`/dashboard`) and the management view (`/manage`) done. Rebalancing and credits next. |
 
 After the MVP:
@@ -211,31 +211,29 @@ After the MVP:
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install -r reference/requirements.txt
-.venv/bin/python reference/export.py               # float32 weights/ (538 MB), the ground truth
-.venv/bin/python reference/check.py                # step 1 checks, writes testvectors/
-.venv/bin/python reference/export.py --dtype int8  # int8 weights (135 MB), what phones get
-.venv/bin/python reference/check_int8.py           # int8 vs float32, writes testvectors-int8/
+.venv/bin/python reference/export.py   # writes weights/ (538 MB)
+.venv/bin/python reference/check.py    # step 1 checks, writes testvectors/
 .venv/bin/python reference/tokenizer_vectors.py
-(cd engine && npm run check && npm run check:int8) # step 2 checks, both exports
+(cd engine && npm run check)           # step 2 checks
 cd swarm && npm install
-npm run check                          # step 3 checks on int8 (Node 22+); check:float32 for float32
-npm start                              # int8; then open http://localhost:8080 in 3+ tabs,
+npm run check                          # step 3 checks (Node 22+)
+npm start                              # then open http://localhost:8080 in 3+ tabs,
                                        # and /dashboard or /manage on the laptop
 cd ../docker && npm install && npm test   # step 3.5: phones as containers (Docker)
 ```
 
-`weights/`, `testvectors/` and `testvectors-int8/` are generated and not committed.
+`weights/` and `testvectors/` are generated and not committed.
 
-### int8 weights: a quarter of the download
+### int8 weights (experimental, not the default)
 
-The tracker serves int8 by default: every matrix stored as int8 with one
-float32 scale per row. Phones download 57 MB for blocks 1 and 3 and 50 MB for
-block 2, instead of 226 and 198 MB, and hold them as int8 in memory too.
-`npm run start:float32` (or `--weights ../weights/smollm2-135m-instruct`)
-serves float32 instead.
+`reference/export.py --dtype int8` stores every matrix as int8 with one
+float32 scale per row: a quarter of the download (57 MB for blocks 1 and 3,
+50 MB for block 2). `reference/check_int8.py` compares it with float32 and
+writes `testvectors-int8/`; `npm run check:int8` in `engine/` runs the JS
+checks on it, and `node tracker.js --weights ../weights/smollm2-135m-instruct-int8`
+serves it.
 
-int8 is no longer Hugging Face's answer token for token. Fed the float32
-answers, it picks the same next token 194 times out of 198 (mean KL 0.0036),
-and answers stay sensible, but a near-tie can flip and the text drifts from
-there. Splitting still changes nothing: every split of the int8 model is
-bit-identical to the unsplit int8 model.
+It is not good enough for this 135M model: on longer questions it picks
+float32's next token 194 times out of 198, but on short chats like "hi" it
+never emits `<|im_end|>` and repeats itself until the token limit. Bigger
+models quantize far better; this format is groundwork for them.

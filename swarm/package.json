@@ -8,9 +8,7 @@
   },
   "scripts": {
     "start": "node tracker.js",
-    "start:float32": "node tracker.js --weights ../weights/smollm2-135m-instruct",
-    "check": "node test/check.js",
-    "check:float32": "node test/check.js ../weights/smollm2-135m-instruct ../testvectors"
+    "check": "node test/check.js"
   },
   "dependencies": {
     "@arkiv-network/sdk": "^1.0.1",

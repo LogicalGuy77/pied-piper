@@ -6,10 +6,10 @@ import { Stage } from "./stage.js";
 
 export class Pipeline {
   // boundaries like [0, 8, 22, 30] give stages [0, 8), [8, 22), [22, 30).
-  static async load({ manifest, boundaries, readFile }) {
+  static async load({ manifest, boundaries, readFile, kernels }) {
     const stages = [];
     for (let i = 0; i + 1 < boundaries.length; i++) {
-      stages.push(await Stage.load({ manifest, start: boundaries[i], end: boundaries[i + 1], readFile }));
+      stages.push(await Stage.load({ manifest, start: boundaries[i], end: boundaries[i + 1], readFile, kernels }));
     }
     return new Pipeline(stages);
   }

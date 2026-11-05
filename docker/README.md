@@ -10,9 +10,8 @@ heat throttling and a crowded real Wi-Fi. That's step 4, on real phones.
 
 ## Run
 
-Needs Docker with Compose, plus the outputs of steps 1–3: the int8 export
-and `testvectors-int8/` (the tracker serves int8 by default), and
-`npm install` in `swarm/`. The results below were measured on float32.
+Needs Docker with Compose, plus the outputs of steps 1–3 (`weights/`,
+`testvectors/`, and `npm install` in `swarm/`).
 
 ```sh
 cd docker && npm install

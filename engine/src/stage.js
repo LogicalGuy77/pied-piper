@@ -22,6 +22,7 @@
 // typed-array view): fs in Node, fetch in the browser.
 
 import { addInPlace, attention, copyRow, matmul, rmsNorm, rope, ropeInvFreq, siluMul } from "./kernels.js";
+import { WasmArena } from "./wasm.js";
 
 if (new Uint8Array(new Uint16Array([1]).buffer)[0] !== 1) {
   throw new Error("weights and h are little-endian float32; this platform is big-endian");
@@ -51,7 +52,19 @@ async function readTensors(readFile, entry) {
   return tensors;
 }
 
-const bytesOf = (w) => (w instanceof Float32Array ? w.byteLength : w.q.byteLength + w.scale.byteLength);
+// The same, with every matrix moved into the stage's wasm arena. Norm vectors
+// are copied out, so nothing keeps the file's buffer alive.
+async function loadTensors(readFile, entry, arena) {
+  const tensors = await readTensors(readFile, entry);
+  if (!arena) return tensors;
+  for (const t of entry.tensors) {
+    const w = tensors[t.name];
+    tensors[t.name] = t.shape.length === 2 ? arena.matrix(w, t.shape[0], t.shape[1]) : w.slice();
+  }
+  return tensors;
+}
+
+const bytesOf = (w) => w.byteLength ?? w.q.byteLength + w.scale.byteLength;
 
 // Per-session, per-layer KV cache: [tokens, kvHeads, headDim], grown by doubling.
 class KVCache {
@@ -84,26 +97,38 @@ class KVCache {
 }
 
 export class Stage {
-  static async load({ manifest, start, end, readFile }) {
+  // kernels: "auto" runs the matmuls in WASM SIMD where the browser or Node
+  // supports it and in plain JS otherwise; "wasm" or "js" forces one.
+  static async load({ manifest, start, end, readFile, kernels = "auto" }) {
     const L = manifest.config.num_layers;
     if (!(start >= 0 && start < end && end <= L)) {
       throw new Error(`layer range [${start}, ${end}) is outside 0..${L}`);
     }
-    const layers = [];
-    for (let i = start; i < end; i++) layers.push(await readTensors(readFile, manifest.layers[i]));
     const tied = manifest.lm_head === null;
     const hasEmbedding = start === 0;
     const hasOutput = end === L;
-    let embed = null, finalNorm = null, lmHead = null;
-    if (hasEmbedding || (hasOutput && tied)) embed = (await readTensors(readFile, manifest.embed)).embed_tokens;
-    if (hasOutput) {
-      finalNorm = (await readTensors(readFile, manifest.final_norm)).norm;
-      lmHead = tied ? embed : (await readTensors(readFile, manifest.lm_head)).lm_head;
+    const entries = manifest.layers.slice(start, end);
+    if (hasEmbedding || (hasOutput && tied)) entries.push(manifest.embed);
+    if (hasOutput) entries.push(manifest.final_norm, ...(tied ? [] : [manifest.lm_head]));
+
+    let arena = null;
+    if (kernels !== "js") {
+      arena = await WasmArena.create(entries.reduce((sum, e) => sum + e.bytes, 0));
+      if (!arena && kernels === "wasm") throw new Error("WebAssembly SIMD is not available here");
     }
-    return new Stage(manifest.config, start, end, layers, embed, finalNorm, lmHead);
+    const layers = [];
+    for (let i = start; i < end; i++) layers.push(await loadTensors(readFile, manifest.layers[i], arena));
+    let embed = null, finalNorm = null, lmHead = null;
+    if (hasEmbedding || (hasOutput && tied)) embed = (await loadTensors(readFile, manifest.embed, arena)).embed_tokens;
+    if (hasOutput) {
+      finalNorm = (await loadTensors(readFile, manifest.final_norm, arena)).norm;
+      lmHead = tied ? embed : (await loadTensors(readFile, manifest.lm_head, arena)).lm_head;
+    }
+    return new Stage(manifest.config, start, end, layers, embed, finalNorm, lmHead, arena ? "wasm" : "js");
   }
 
-  constructor(config, start, end, layers, embed, finalNorm, lmHead) {
+  constructor(config, start, end, layers, embed, finalNorm, lmHead, kernels = "js") {
+    this.kernels = kernels;
     this.start = start;
     this.end = end;
     this.hasEmbedding = start === 0;

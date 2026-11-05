@@ -60,7 +60,7 @@ async function start(server) {
     await peer.loadTokenizer();
     post({ type: "tokenizer" });
     await peer.load();
-    post({ type: "loaded", describe: peer.stage.describe(), weightBytes: peer.stage.weightBytes, fromCache });
+    post({ type: "loaded", describe: peer.stage.describe(), weightBytes: peer.stage.weightBytes, fromCache, kernels: peer.stage.kernels });
   } catch (err) {
     post({ type: "fatal", message: err.message });
   }
