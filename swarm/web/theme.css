@@ -1,0 +1,57 @@
+/* Shared look for the phone page, the dashboard and the management view:
+   white cards on a soft grey canvas, one purple accent, and one colour per
+   block that means the same block on every page. Light only, on purpose: it
+   is a projector and phone-in-hand demo. */
+:root {
+  --canvas: #e9e9ef;
+  --page: #fafafc;
+  --surface: #ffffff;
+  --sunk: #f3f3f7;
+  --hover: #f6f5fa;
+  --line: #ececf2;
+  --line-2: #dcdbe5;
+  --ink: #1b1a24;
+  --ink-2: #3a3946;
+  --muted: #7f7e8c;
+  --soft: #a9a8b6;
+
+  --purple: #6d4ce6;
+  --purple-ink: #5a3bd0;
+  --purple-soft: #f0ebfe;
+  --purple-wash: #f8f5ff;
+  --purple-line: #d8ccfa;
+  --green: #17945f;
+  --green-soft: #e5f6ee;
+  --amber: #b9720a;
+  --amber-soft: #fcf1de;
+  --red: #d2425b;
+  --red-soft: #fdebef;
+
+  --hero: linear-gradient(112deg, #f8f7fb 0%, #f3eef9 42%, #ead9ef 78%, #e2c8e6 100%);
+  --shadow-app: 0 1px 2px rgba(30, 20, 60, .04), 0 18px 50px rgba(30, 20, 60, .08);
+
+  --sans: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  /* Blocks: strong colour for marks and text, soft for fills. Six, then repeat. */
+  --k0: #0f8f9c; --k0s: #e0f3f5;
+  --k1: #6d4ce6; --k1s: #efeafd;
+  --k2: #d0682a; --k2s: #fdebdf;
+  --k3: #c93f78; --k3s: #fce7ef;
+  --k4: #2a9a5a; --k4s: #e3f5ea;
+  --k5: #3b74d6; --k5s: #e6eefc;
+
+  /* Older names, still used by the Arkiv panel (arkiv.js). */
+  --bg: var(--page); --card: var(--surface); --text: var(--ink); --accent: var(--purple-ink); --bad: var(--red);
+  --b1: var(--k0s); --b1s: var(--k0); --b2: var(--k1s); --b2s: var(--k1); --b3: var(--k2s); --b3s: var(--k2);
+
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { font: 14px/1.5 var(--sans); color: var(--ink); background: var(--page); -webkit-font-smoothing: antialiased; }
+a { color: var(--purple-ink); }
+button, input, select, textarea { font-family: inherit; }
+:focus-visible { outline: 2px solid var(--purple); outline-offset: 2px; }
+[hidden] { display: none !important; }

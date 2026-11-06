@@ -51,7 +51,7 @@ function render(state) {
   });
   const minCap = Math.min(...blockRows.map((x) => x.cap ?? Infinity));
   $("blocks").innerHTML = `<tr><th>Block</th><th class="l">Holds</th><th>Phones ready</th><th>Capacity tok/s</th><th>Served tok/s</th><th>Avg utilization</th><th class="l"></th></tr>`
-    + blockRows.map((x) => `<tr class="b${x.b.index % 3}"><td>Block ${x.b.index + 1}</td><td class="l muted">${x.label}</td>
+    + blockRows.map((x) => `<tr class="b${x.b.index % 6}"><td>Block ${x.b.index + 1}</td><td class="l muted">${x.label}</td>
       <td class="${x.r.length < 2 ? "bad" : ""}">${x.r.length} / ${x.holders.length}</td><td>${num(x.cap)}</td><td>${num(x.served)}</td>
       <td>${utilBar(x.util)}</td><td class="l">${x.cap != null && x.cap === minCap && blockRows.length > 1 ? '<span class="warn">bottleneck</span>' : ""}</td></tr>`).join("");
 
@@ -71,7 +71,7 @@ function render(state) {
       if (r.hidden) status.push('<span class="bad">background</span>');
       if (p.silentMs > 2500) status.push(`<span class="bad">silent ${Math.round(p.silentMs / 1000)} s</span>`);
       const network = p.tokenMs != null && r.decodeMsPerToken != null ? Math.max(0, p.tokenMs - r.decodeMsPerToken) : null;
-      return `<tr class="b${p.block % 3}"><td><b>${esc(p.id)}</b></td><td>${p.block + 1}</td><td class="l">${status.join(" · ")}</td>
+      return `<tr class="b${p.block % 6}"><td><b>${esc(p.id)}</b></td><td>${p.block + 1}</td><td class="l">${status.join(" · ")}</td>
         <td>${num(p.servedPerSec)}</td><td>${num(age > 0 ? p.served / age : null)}</td><td>${num(capacity(p))}</td>
         <td>${utilBar(p.utilization)}</td><td>${ms(r.decodeMsPerToken)}</td><td>${ms(p.tokenMs)}</td><td>${ms(network)}</td><td>${ms(p.rtt)}</td>
         <td>${p.served.toLocaleString()}</td><td>${r.battery != null ? `${r.battery}%${r.charging ? " ⚡" : ""}` : "–"}</td>
