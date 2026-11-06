@@ -76,19 +76,24 @@ flowchart LR
     class C1,F2 b3
 ```
 
-The tracker picks the least-busy holder of each block, so both questions run
-at once on different phones. E also holds block 2 and keeps serving other
+The tracker picks, for each block, the holder that should deliver tokens
+soonest: its measured time per token, shared with the answers it is already
+generating. So both questions run at once on different phones, and slow
+phones are passed over. E also holds block 2 and keeps serving other
 people while it asks. In v1 the laptop relays every hop over WebSocket; later,
 phones send to each other directly.
 
 1. **E** types a question. Its tokenizer turns the text into token ids.
-2. The tracker picks a route: the least-busy holder of each block, here **D**, **H** and **C**.
+2. The tracker picks a route: the fastest available holder of each block, here **D**, **H** and **C**.
 3. **D** looks up the embedding for every token of the question at once, runs layers 0–7, and sends h on.
 4. **H** runs layers 8–21 and sends h on.
 5. **C** runs layers 22–29, then the output layer, which picks the next token.
 6. **E** shows the token and sends it back through the same route. Each phone
    on the route keeps a KV cache for E's session, so after the first pass only
    the one new token travels, never the whole conversation.
+7. The session lasts the whole conversation. When E asks a follow-up, the
+   same route still holds the KV caches, so only the new question's tokens
+   travel.
 
 ## What runs on one phone
 
@@ -191,9 +196,9 @@ ETHGlobal piece.
 |---|---|---|
 | 1 | **Python reference.** Export the weights as blocks, write a NumPy stage engine, and prove that split runs give exactly the same tokens as the unsplit model. | Done: 17/17 checks. Matches Hugging Face, and every split is bit-identical. [reference/](reference/README.md) |
 | 2 | **JS engine in Node.** Port the stage to JavaScript and check it against step 1's test vectors. | Done: 16/16 checks. Matches Python to about 1e-6, 30 ms per token on a laptop with the WASM kernels (130 ms in plain JS). [engine/](engine/README.md) |
-| 3 | **Swarm in browser tabs.** Tracker, routes and sessions, with several tabs on one laptop standing in for phones. The output must match Hugging Face token for token. | Done: 21/21 checks. 40 of 40 tokens through the swarm, and h on the wire is bit-identical to step 2. [swarm/](swarm/README.md) |
+| 3 | **Swarm in browser tabs.** Tracker, routes and sessions, with several tabs on one laptop standing in for phones. The output must match Hugging Face token for token. | Done: 35/35 checks. 40 of 40 tokens through the swarm, and h on the wire is bit-identical to step 2. Speed-aware routing, and conversations that keep their KV caches between questions. [swarm/](swarm/README.md) |
 | 3.5 | **Mock phones as containers.** Each phone is a Docker container running Chromium, behind HTTPS, with Wi-Fi delay and loss, frozen phones, killed phones and slow phones. | Done: 16/16 scenarios. Wi-Fi adds about 70 ms per token; a frozen phone is dropped after 5 s. [docker/](docker/README.md) |
-| 4 | **Real phones.** HTTPS, screen wake lock, weights cached in the browser, phones that stay reachable while they compute, then faster WASM kernels with int8 weights. | Real phones answered over a Cloudflare tunnel and on the LAN. Wake lock, weight cache and busy-aware heartbeat done: 28/28 swarm checks, 17/17 container checks. WASM SIMD matmul kernels done: 4× faster per token, 12× faster on the prompt. [engine/](engine/README.md#speed) [swarm/](swarm/README.md#real-phones) |
+| 4 | **Real phones.** HTTPS, screen wake lock, weights cached in the browser, phones that stay reachable while they compute, then faster WASM kernels with int8 weights. | Real phones answered over a Cloudflare tunnel and on the LAN. Wake lock, weight cache and busy-aware heartbeat done: 17/17 container checks. WASM SIMD matmul kernels done: 4× faster per token, 12× faster on the prompt. [engine/](engine/README.md#speed) [swarm/](swarm/README.md#real-phones) |
 | 5 | **Credits, recovery, dashboard.** Credit balances, rerouting when a phone leaves, rebalancing blocks, and a live view of the swarm. | Rerouting, the dashboard (`/dashboard`) and the management view (`/manage`) done. Rebalancing and credits next. |
 
 After the MVP:

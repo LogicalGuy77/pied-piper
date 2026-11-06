@@ -43,7 +43,7 @@ function phoneCard(p) {
   if (r.battery != null) flags.push([`${r.battery}%${r.charging ? " ⚡" : ""}`, r.battery < 20 && !r.charging ? "warn" : ""]);
   const lines = [
     `ping ${ms(p.rtt)} · token ${ms(p.tokenMs)} · prefill ${p.prefillMsPerToken == null ? "–" : `${p.prefillMsPerToken.toFixed(0)} ms/tok`}`,
-    `served ${p.served} tok · ${p.sessions} session${p.sessions === 1 ? "" : "s"}${r.avgComputeMs ? ` · compute ${r.avgComputeMs.toFixed(0)} ms/tok` : ""}`,
+    `served ${p.served} tok · ${p.sessions} answering${p.idleSessions ? `, ${p.idleSessions} idle` : ""}${r.avgComputeMs ? ` · compute ${r.avgComputeMs.toFixed(0)} ms/tok` : ""}`,
   ];
   if (r.device || r.cores) lines.push([r.device, r.cores && `${r.cores} cores`, r.memoryGB && `${r.memoryGB} GB`].filter(Boolean).join(" · "));
   return `<div class="phone${p.ready ? "" : " loading"}">
@@ -54,7 +54,7 @@ function phoneCard(p) {
 function render() {
   showQr();
   $("nPhones").textContent = state.peers.length;
-  $("nSessions").textContent = state.sessions.length;
+  $("nSessions").textContent = state.sessions.filter((s) => s.active).length;
   $("nServed").textContent = state.peers.reduce((sum, p) => sum + p.served, 0);
   $("blocks").innerHTML = state.blocks.map((b) => {
     const holders = state.peers.filter((p) => p.block === b.index);
@@ -70,7 +70,9 @@ function render() {
       ${holders.map(phoneCard).join("")}</div>`;
   }).join("");
   $("sessions").textContent = state.sessions.length
-    ? state.sessions.map((s) => `#${s.id}  ${s.asker} asks via ${s.route.join(" → ")} · ${s.tokens} tokens${s.reroutes ? ` · rerouted ${s.reroutes}×` : ""}`).join("\n")
+    ? state.sessions.map((s) => `#${s.id}  ${s.asker} ${s.active ? "asks" : "idle"} via ${s.route.join(" → ")} · ` +
+      (s.active ? `${s.tokens} tokens` : `${s.context} tokens cached`) +
+      `${s.turn > 1 ? ` · turn ${s.turn}` : ""}${s.reroutes ? ` · rerouted ${s.reroutes}×` : ""}`).join("\n")
     : "None right now.";
   const log = $("events");
   const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;

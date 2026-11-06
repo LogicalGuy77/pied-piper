@@ -66,27 +66,47 @@ async function start(server) {
   }
 }
 
-async function ask(messages, maxNew, chatId) {
+// The conversation's token ids as the swarm has seen them: every prompt, and
+// every answer exactly as generated (not re-tokenized from its text), so
+// each new question extends what the route's KV caches already hold.
+let conversation = null;
+
+// messages is the same conversation as text, up to this question, for Arkiv.
+async function ask(text, messages, maxNew, chatId) {
   const tok = peer.tokenizer;
+  const turn = `<|im_start|>user\n${text}<|im_end|>\n<|im_start|>assistant\n`;
+  const ids = conversation ? [...conversation, ...tok.encode(`\n${turn}`)] : tok.chat([{ role: "user", content: text }]);
   const decoder = tok.streamDecoder();
-  let tokens = 0, firstMs = 0, restMs = 0, reroutes = 0;
+  const answer = [];
+  let firstMs = 0, restMs = 0, reroutes = 0, cached = 0;
   try {
-    for await (const step of peer.ask(tok.chat(messages), { maxNew, stopIds: [tok.eosId], record: chatId ? { chatId, messages } : null })) {
-      tokens++;
+    const record = chatId ? { chatId, messages } : null;
+    for await (const step of peer.ask(ids, { maxNew, stopIds: [tok.eosId], keep: true, record })) {
+      answer.push(step.token);
       reroutes = step.reroutes;
-      if (tokens === 1) firstMs = step.ms;
+      cached = step.cached;
+      if (answer.length === 1) firstMs = step.ms;
       else restMs += step.ms;
       post({ type: "token", text: decoder.push(step.token), route: step.route, session: step.session });
     }
     post({ type: "token", text: decoder.flush() });
-    post({ type: "done", tokens, firstMs, msPerToken: tokens > 1 ? restMs / (tokens - 1) : 0, reroutes });
+    conversation = [...ids, ...answer];
+    if (answer.at(-1) !== tok.eosId) conversation.push(tok.eosId);
+    const tokens = answer.length;
+    post({ type: "done", tokens, firstMs, msPerToken: tokens > 1 ? restMs / (tokens - 1) : 0, reroutes, cached, prompt: ids.length });
   } catch (err) {
-    post({ type: "error", message: err.message });
+    post({ type: "error", message: err.message }); // the conversation stays as it was before this question
   }
+}
+
+function newChat() {
+  conversation = null;
+  peer?.endChat();
 }
 
 self.onmessage = ({ data }) => {
   if (data.type === "start") start(data.server);
-  else if (data.type === "ask") ask(data.messages, data.maxNew, data.chatId);
+  else if (data.type === "ask") ask(data.text, data.messages, data.maxNew, data.chatId);
+  else if (data.type === "new-chat") newChat();
   else if (data.type === "stats") peer?.report(data.stats);
 };

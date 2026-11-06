@@ -12,7 +12,7 @@ Needs Node 22+ and the outputs of step 1 (`weights/` and `testvectors/`):
 ```sh
 .venv/bin/python reference/tokenizer_vectors.py   # once: tokenizer ids for the checks
 cd swarm && npm install
-npm run check      # 28 checks, about 1.5 min
+npm run check      # 35 checks, under a minute
 npm start          # tracker on http://localhost:8080
 ```
 
@@ -61,6 +61,10 @@ WebSocket, the same path a tab uses.
 | **Greedy answer through the swarm equals Hugging Face's** | 40 of 40 |
 | Every h sent between phones is bit-identical to step 2's in-process run | 80 of 80 frames |
 | Two askers at once get disjoint routes and their solo answers | A → B → C and D → E → F |
+| **Speed-aware routing**: B made 150 ms slower per frame | measured at 109 ms per token against E's 21; the next three questions all go through E, two of them at once |
+| **A follow-up question** in the same conversation | same session, 15 tokens sent instead of 59, answer equals a fresh run on the whole conversation |
+| A phone on the conversation's route leaves between questions | the next question replays the conversation (81 tokens) through another phone and is still right |
+| New chat | the session ends and every phone frees its KV cache |
 | **A phone leaving mid-answer** | rerouted to A → E → C; all 30 tokens still equal Hugging Face's |
 | The last holder of a block leaving mid-answer | clear error: "no other phone has block 2 ready" |
 | Sessions end | every phone has freed every KV cache |
@@ -94,10 +98,14 @@ the reference answer through A → B → C.
 holders, and the tab downloads that block's weights from `/weights/`. When
 loaded, it tells the tracker it is ready. Only ready phones get routed to.
 
-**Asking.** The asker asks the tracker for a session. The tracker picks the
-ready holder of each block with the fewest active sessions, and the route
-stays fixed for the whole answer because each phone on it keeps the session's
-KV cache. Then, for every token:
+**Asking.** The asker asks the tracker for a session. For each block the
+tracker picks the ready holder that should deliver tokens soonest: its
+measured time per token (compute plus network, from the frames it has
+answered) times one plus the answers it is already generating. A phone not
+measured yet counts as its block's median. So a slow phone is passed over,
+and a fast one takes a second answer before a slow one takes its first. The
+route stays fixed for the whole conversation because each phone on it keeps
+the session's KV cache. Then, for every token:
 
 ```
 asker ──TOKENS hop 0──▶ tracker ──▶ block 1 ──HIDDEN hop 1──▶ tracker ──▶ block 2
@@ -160,8 +168,26 @@ every token, as before, grows with the square of the number of phones.
 on the LAN need. [docker/](../docker/README.md) uses it with a self-signed
 certificate. `--public-url` is the address the dashboard's QR code shows.
 
-**Ending.** On `<|im_end|>` or the token limit, the asker sends `end`, and the
-tracker tells every phone on the route to drop the session's KV cache.
+**Conversations.** A session is a whole conversation, not one answer. When
+an answer ends (`<|im_end|>` or the token limit), the page's asker sends
+`turn` instead of `end`: the session goes idle and every phone on its route
+keeps its KV cache. The worker builds the next question by appending to the
+conversation's token ids, with each answer exactly as generated rather than
+re-tokenized from its text, so the new prompt starts with everything the
+route has already seen. `peer.ask` checks that, asks the tracker to continue
+the session, and sends only the new tokens: a follow-up costs its own length,
+not the conversation's. In the browser, "And of Germany?" after "What is the
+capital of France?" sent 15 of its 59 prompt tokens.
+
+If a phone on the route leaves while the conversation is idle, the tracker
+reroutes it as usual, and the next question replays the whole conversation
+through the new route. If the tracker has ended the session meanwhile, the
+asker starts a new one and replays it too.
+
+**Ending.** New chat sends `end`, and the tracker tells every phone on the
+route to drop the session's KV cache. So does a conversation idle for 10
+minutes (`--session-idle`). Askers that don't keep the conversation (the
+checks, mostly) end the session after each answer.
 
 ## Open database on Arkiv
 
@@ -179,18 +205,20 @@ Without a key the swarm runs as before and answers say "Arkiv is off".
 
 **What is saved.** One chat is one entity under the schema
 `pied-piper.conversation.v1`: the messages so far, and one metrics entry per
-answer (prompt and answer tokens, first token time, ms per token, tokens per
+answer (prompt and answer tokens, how many prompt tokens the route had
+cached, first token time, ms per token, tokens per
 second, the route, time per hop, reroutes, how it finished). The first answer
 of a chat creates the entity; each later answer patches it and pushes its
 expiry a day out, in one transaction. An entity expires a day after its last
 write. New chat starts a new entity.
 
 **How.** When `Peer.ask` sees the stop token (or the token limit), it sends
-`record` with the chat to the tracker, before ending the session. The tracker
+`record` with the chat to the tracker, before the session goes idle. The tracker
 adds its own measurements of the session and writes the entity
 (`src/arkiv.js`); the private key never leaves the laptop. The asker gets
 `recorded` back, with the entity and transaction links, shown under the
-answer. Only the asker of a session that produced tokens can record it, once.
+answer. Only the asker of a session can record it, once per answer that
+produced tokens.
 
 **Peeking.** "Peek at the database" on the phone page, and `/arkiv` on the
 laptop, list the tracker's latest add and update transactions with explorer
@@ -200,7 +228,7 @@ up as a new block height, one more turn and a "just updated" mark.
 ## Wire format
 
 Control messages are small JSON: `hello`, `welcome`, `ready`, `ask`,
-`session`, `reroute`, `end`, `drop`, `fail`, `error`, `stats`, `swarm`,
+`session`, `turn`, `reroute`, `end`, `drop`, `fail`, `error`, `stats`, `swarm`,
 `record`/`recorded` for Arkiv, and
 `watch`/`state` for the dashboards.
 
@@ -230,6 +258,6 @@ slower; each phone's page says which kernels it runs.
   phones fill the emptiest block, but nothing moves a phone that has joined.
 - Attention, RoPE and SiLU in WASM too; credits (step 5).
 - Direct phone-to-phone WebRTC (after the MVP).
-- Each question re-sends the whole conversation as a new session, so long
-  chats get slow to start (about 0.13 s per prompt token). The page has a New
-  chat button; keeping the KV cache across turns is the real fix.
+- A cap on KV cache memory per phone. Idle conversations hold theirs until
+  New chat or 10 minutes idle; many long conversations on one phone could
+  exceed its memory first.

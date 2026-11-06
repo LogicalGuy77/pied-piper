@@ -56,7 +56,9 @@ on every phone's link and on the tracker's, which measured 16 ms average ping.
 - **Long chats get slow to start.** Each question re-sends the whole
   conversation, at about 0.13 s per prompt token on a laptop. An early run of
   this test asked everything in one chat, and the first token grew from 5 s
-  to 120 s. The page now has a **New chat** button. Keeping each phone's KV
+  to 120 s. The page now has a **New chat** button. (Since fixed: a
+  conversation keeps its KV caches between questions; see
+  [swarm/](../swarm/README.md#how-it-fits-together).) Keeping each phone's KV
   cache between turns would fix it properly.
 - Memory: about 540 MB per phone in Chromium, more than the 300 MB budget
   for the 226 MB block. Worth measuring on real phones; int8 weights (step 4)

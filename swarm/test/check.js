@@ -12,11 +12,15 @@
 //     (Hugging Face's, for float32).
 //  6. The h sent between phones is bit-identical to step 2's in-process run.
 //  7. Two askers at once get different routes and their solo answers.
-//  8. A phone leaving mid-answer: the answer is rerouted and is still exactly
+//  8. Routing is speed-aware: a slow phone is passed over, even for a fast
+//     phone that is already answering.
+//  9. A conversation keeps its KV caches between questions: a follow-up sends
+//     only its new tokens, and survives a phone on its route leaving.
+// 10. A phone leaving mid-answer: the answer is rerouted and is still exactly
 //     right; with no other holder of its block, the asker gets a clear error.
-//  9. When sessions end, every phone frees their KV caches.
-// 10. A phone silent while it computes is kept; silent while idle, dropped.
-// 11. Phones get a small summary; the dashboard gets everything, and a QR code.
+// 11. When sessions end, every phone frees their KV caches.
+// 12. A phone silent while it computes is kept; silent while idle, dropped.
+// 13. Phones get a small summary; the dashboard gets everything, and a QR code.
 //
 //   cd swarm && npm run check
 //   node test/check.js WEIGHTS_DIR TESTVECTORS_DIR   # another export, e.g. a quantized one
@@ -118,7 +122,7 @@ const prompt = index.prompt_ids;
 const greedy = index.greedy_tokens;
 const otherPrompt = tok.chat([{ role: "user", content: "What is the capital of France?" }]);
 const reference = { h1: [], h2: [], otherTokens: null };
-const local = []; // the three blocks in this process; check 10's phone serves one of them
+const local = []; // the three blocks in this process; check 12's phone serves one of them
 {
   const weights = await openWeights(WEIGHTS);
   for (let i = 0; i < 3; i++) local.push(await Stage.load({ ...weights, start: BOUNDARIES[i], end: BOUNDARIES[i + 1] }));
@@ -131,6 +135,25 @@ const local = []; // the three blocks in this process; check 10's phone serves o
     ids = Int32Array.of(greedy[i]);
   }
   reference.otherTokens = generate(new Pipeline(local), "solo", otherPrompt, SHORT, new Set([EOS])).tokens;
+}
+
+// A three-question conversation, built the way the phone page builds it: each
+// question extends the previous prompt and the answer exactly as generated.
+// Each turn's reference answer is a fresh run on the whole conversation.
+const TURN = 12;
+const conversation = { ids: [], answers: [] };
+{
+  const pipe = new Pipeline(local);
+  let ids = otherPrompt;
+  for (const [k, question] of ["And of Germany?", "And of Italy?", null].entries()) {
+    const answer = generate(pipe, `turn${k}`, ids, TURN, new Set([EOS])).tokens;
+    pipe.drop(`turn${k}`);
+    conversation.ids.push(ids);
+    conversation.answers.push(answer);
+    if (!question) break;
+    ids = [...ids, ...answer, ...(answer.at(-1) === EOS ? [] : [EOS]),
+      ...tok.encode(`\n<|im_start|>user\n${question}<|im_end|>\n<|im_start|>assistant\n`)];
+  }
 }
 
 // --- Start the tracker and the phones ---
@@ -253,7 +276,83 @@ console.log("7. Two askers at once");
     JSON.stringify(tok.decode(b.map((x) => x.token))));
 }
 
-console.log("8. A phone leaves mid-answer");
+console.log("8. Speed-aware routing");
+{
+  // One block-2 phone gets 150 ms slower per frame. Two questions at once put
+  // it on one of the routes, so the tracker measures it.
+  const [slow, fast] = phones.filter((p) => p.block.index === 1);
+  const original = slow.stage.forwardAsync;
+  slow.stage.forwardAsync = async function (...args) {
+    await wait(150);
+    return original.apply(this, args);
+  };
+  const both = await Promise.all([
+    collect(phones[0].ask(prompt, { maxNew: SHORT, stopIds: [EOS] })),
+    collect(phones[3].ask(otherPrompt, { maxNew: SHORT, stopIds: [EOS] })),
+  ]);
+  const measured = both.some((steps) => steps[0].route[1] === slow.id);
+  const token = (id) => watch.state.peers.find((p) => p.id === id)?.tokenMs;
+  await until(() => token(slow.id) > 3 * token(fast.id));
+  check("the slow phone's time per token is measured", measured && token(slow.id) > 3 * token(fast.id),
+    `${slow.id} ${token(slow.id)?.toFixed(0)} ms, ${fast.id} ${token(fast.id)?.toFixed(0)} ms`);
+  const alone = await collect(phones[0].ask(prompt, { maxNew: 3, stopIds: [EOS] }));
+  const together = await Promise.all([
+    collect(phones[0].ask(prompt, { maxNew: SHORT, stopIds: [EOS] })),
+    collect(phones[3].ask(otherPrompt, { maxNew: SHORT, stopIds: [EOS] })),
+  ]);
+  const routes = [alone, ...together].map((steps) => steps[0].route);
+  check("new questions go to the fast phone, even when it is already answering one",
+    routes.every((r) => r[1] === fast.id) && same(together[1].map((x) => x.token), reference.otherTokens),
+    routes.map((r) => r.join(" → ")).join(", "));
+  slow.stage.forwardAsync = original;
+}
+
+console.log("9. A conversation keeps its KV cache between questions");
+{
+  const ask = (k) => collect(asker.ask(conversation.ids[k], { maxNew: TURN, stopIds: [EOS], keep: true }));
+  const firstFrame = (session, from) => sent.slice(from).find((s) => s.from === asker.id && s.frame.session === session && s.frame.kind === KIND.TOKENS)?.frame;
+  const t1 = await ask(0);
+  const session = t1[0].session;
+  await until(() => watch.state.sessions.some((s) => s.id === session && !s.active));
+  const onRoute = t1[0].route.map((id) => phones.find((p) => p.id === id));
+  check("after an answer, the conversation stays open and every phone on its route keeps the KV cache",
+    same(t1.map((x) => x.token), conversation.answers[0]) &&
+    onRoute.every((p) => p.stage.sessions.includes(`${session}.0`)) &&
+    watch.state.sessions.some((s) => s.id === session && !s.active),
+    `session ${session} idle, ${watch.state.sessions.find((s) => s.id === session)?.context} tokens cached on ${t1[0].route.join(" → ")}`);
+
+  const mark = sent.length;
+  const t2 = await ask(1);
+  const frame = firstFrame(session, mark);
+  const expectCached = conversation.ids[0].length + t1.length - 1;
+  check("the follow-up reuses the session and sends only its new tokens",
+    t2[0].session === session && t2[0].cached === expectCached && frame?.pos === expectCached && frame?.n === conversation.ids[1].length - expectCached,
+    `${frame?.n} tokens sent instead of ${conversation.ids[1].length}`);
+  check("its answer equals a fresh run on the whole conversation", same(t2.map((x) => x.token), conversation.answers[1]),
+    JSON.stringify(tok.decode(t2.map((x) => x.token))));
+
+  // A phone on the route leaves between questions; a new phone takes its place in the swarm.
+  const leaver = phones.find((p) => p.id === t2[0].route[1]);
+  leaver.close();
+  phones.splice(phones.indexOf(leaver), 1);
+  await until(() => !listed(leaver.id));
+  phones.push(await startPeer());
+  const mark3 = sent.length;
+  const t3 = await ask(2);
+  const replay = firstFrame(session, mark3);
+  check("when a phone on the route left between questions, the next one replays the conversation and is still right",
+    t3[0].session === session && !t3[0].route.includes(leaver.id) && replay?.pos === 0 &&
+    replay?.n === conversation.ids[2].length && same(t3.map((x) => x.token), conversation.answers[2]),
+    `${leaver.id} left, now ${t3[0].route.join(" → ")}, replayed ${replay?.n} tokens`);
+
+  asker.endChat();
+  const route = t3[0].route.map((id) => phones.find((p) => p.id === id));
+  const freed = await until(() => route.every((p) => !p.stage.sessions.some((k) => k.startsWith(`${session}.`))) &&
+    !watch.state.sessions.some((s) => s.id === session));
+  check("a new chat ends the session and frees its KV caches", freed);
+}
+
+console.log("10. A phone leaves mid-answer");
 {
   const LONG = 30;
   let leaver = null;
@@ -289,7 +388,7 @@ console.log("8. A phone leaves mid-answer");
     new RegExp(`no other phone has block ${block + 1} ready`).test(error ?? ""), error ?? "no error");
 }
 
-console.log("9. Cleanup");
+console.log("11. Cleanup");
 {
   const freed = await until(() => phones.every((p) => p.stage.sessions.length === 0));
   const left = phones.filter((p) => p.stage.sessions.length).map((p) => `${p.id}: ${p.stage.sessions}`);
@@ -298,11 +397,11 @@ console.log("9. Cleanup");
   check("the tracker has no sessions left", watch.state.sessions.length === 0);
 }
 
-console.log("10. Silent phones: busy versus frozen");
+console.log("12. Silent phones: busy versus frozen");
 {
   // A phone that never answers pings, as a locked screen or a phone stuck in
   // a long prefill looks to the tracker. It takes the block left empty in
-  // check 8 and serves it with this process's copy, but sits on the first
+  // check 10 and serves it with this process's copy, but sits on the first
   // frame for longer than the heartbeat timeout before answering.
   const SILENT_MS = HEARTBEAT_MS + 4000;
   const frozen = new RawSocket(server.replace(/^http/, "ws") + "/ws", { autoPong: false });
@@ -338,7 +437,7 @@ console.log("10. Silent phones: busy versus frozen");
   frozen.terminate();
 }
 
-console.log("11. What phones and the dashboard get");
+console.log("13. What phones and the dashboard get");
 {
   await until(() => swarmState.get(asker.id)?.phones === watch.state.peers.length);
   const summary = swarmState.get(asker.id);

@@ -33,7 +33,7 @@ function render(state) {
     tile(num(fastest), "fastest possible tok/s", "one asker, quickest phone per block"),
     tile(num(t.servedPerSec), "served tok/s", "all phones, all blocks, last minute"),
     tile(t.generated.toLocaleString(), "answer tokens", `${t.served.toLocaleString()} served · up ${dur(t.uptimeMs)}`),
-    tile(`${ready.length}<span class="muted" style="font-size:14px"> / ${state.peers.length}</span>`, "phones ready", `${state.sessions.length} answering now`),
+    tile(`${ready.length}<span class="muted" style="font-size:14px"> / ${state.peers.length}</span>`, "phones ready", `${state.sessions.filter((s) => s.active).length} answering now`),
   ].join("");
 
   const blockRows = state.blocks.map((b) => {

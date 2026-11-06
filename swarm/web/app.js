@@ -11,7 +11,7 @@ let tokenizerReady = false;
 let busy = false;
 let swarm = null;   // latest summary from the tracker
 let myRoute = null; // route of the question this phone is asking
-const messages = []; // the conversation so far, re-sent in full on each question
+const messages = []; // the conversation so far, for the page; the worker keeps its token ids
 let answerEl = null;
 let chatId = newChatId(); // this chat's entity on Arkiv; a new chat gets a new one
 let arkivPanel = null;    // the database peek, once opened
@@ -99,7 +99,8 @@ worker.onmessage = ({ data: e }) => {
     const stats = document.createElement("div");
     stats.className = "stats";
     const rerouted = e.reroutes ? ` · rerouted ${e.reroutes}× when a phone left` : "";
-    stats.textContent = `route ${answerEl.dataset.route} · ${e.tokens} tokens · first token ${(e.firstMs / 1000).toFixed(1)} s · then ${e.msPerToken.toFixed(0)} ms per token${rerouted}`;
+    const cached = e.cached ? ` · ${e.cached} of ${e.prompt} prompt tokens already cached` : "";
+    stats.textContent = `route ${answerEl.dataset.route} · ${e.tokens} tokens · first token ${(e.firstMs / 1000).toFixed(1)} s · then ${e.msPerToken.toFixed(0)} ms per token${cached}${rerouted}`;
     answerEl.append(stats);
     // The tracker saves the conversation to Arkiv; "recorded" says how it went.
     if (!answerEl.querySelector(".arkiv")) answerEl.append(arkivLine("Saving this chat to Arkiv…"));
@@ -134,16 +135,17 @@ $("form").addEventListener("submit", (ev) => {
   answerEl = addMessage("assistant", "");
   busy = true;
   setInputEnabled();
-  worker.postMessage({ type: "ask", messages, maxNew: MAX_NEW, chatId });
+  worker.postMessage({ type: "ask", text, messages, maxNew: MAX_NEW, chatId });
 });
 
-// Each question re-sends the whole conversation, so long chats get slow to
-// start. A new chat starts from an empty one.
+// The phones on the route keep this conversation's KV caches, so a follow-up
+// only sends its new tokens. A new chat frees them and starts from nothing.
 $("new").addEventListener("click", () => {
   messages.length = 0;
   chatId = newChatId();
   arkivPanel?.setChat(chatId);
   $("chat").replaceChildren();
+  worker.postMessage({ type: "new-chat" });
   setInputEnabled();
 });
 
@@ -181,7 +183,8 @@ const shortHex = (hex) => `${hex.slice(0, 8)}…${hex.slice(-4)}`;
 
 // The answer's line under it: created or updated, with links to the entity and the transaction.
 function showRecorded(e) {
-  const el = document.querySelector(`.msg.assistant[data-session="${e.session}"]`);
+  // A conversation's answers share one session; this is about its latest.
+  const el = [...document.querySelectorAll(`.msg.assistant[data-session="${e.session}"]`)].at(-1);
   const line = el?.querySelector(".arkiv") ?? el?.appendChild(arkivLine(""));
   if (line) {
     line.replaceChildren();

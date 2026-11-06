@@ -43,6 +43,7 @@ export class Peer {
     this.decoded = 0;
     this.requests = new Map(); // request id -> { resolve, reject }
     this.asking = new Map();   // session -> state of a question this phone asked
+    this.chat = null;          // the kept conversation, between its turns
     this.nextRequest = 1;
     this.queue = [];           // frames waiting to be served, oldest first
     this.working = false;
@@ -101,16 +102,41 @@ export class Peer {
   }
 
   // Generates greedily through the swarm. Yields { token, session, route,
-  // reroutes, ms } per new token, where ms is the round trip for that token.
+  // reroutes, cached, ms } per new token, where ms is the round trip for that
+  // token and cached is how many tokens of promptIds the route already had.
+  //
+  // With keep, the session stays open after the answer, and every phone on
+  // the route keeps its KV cache. If the next ask's promptIds start with
+  // everything sent so far (the previous prompt and answer), only the rest is
+  // sent. Anything else ends the kept session and starts a new one.
   //
   // record: { chatId, messages } saves the conversation to Arkiv when the
   // answer finishes: messages is the chat up to this question, and the
   // tracker adds the answer's metrics and writes it (it holds the wallet).
   // Needs loadTokenizer(), to turn the answer back into text.
-  async *ask(promptIds, { maxNew = 256, stopIds = [2], record = null } = {}) {
-    const { session, route } = await this.request({ type: "ask" });
-    const q = { attempt: 0, route, reroutes: 0, history: Array.from(promptIds), fed: 0, waiting: null, error: null };
-    this.asking.set(session, q);
+  async *ask(promptIds, { maxNew = 256, stopIds = [2], keep = false, record = null } = {}) {
+    const ids = Array.from(promptIds);
+    const prev = this.chat;
+    this.chat = null;
+    const cached = prev && !prev.error && ids.length > prev.fed && startsWith(ids, prev.history, prev.fed) ? prev : null;
+    if (prev && !cached) this.endSession(prev.session);
+    let reply;
+    try {
+      reply = await this.request({ type: "ask", session: cached?.session });
+    } catch (err) {
+      if (cached) this.endSession(cached.session);
+      throw err;
+    }
+    const { session, route, attempt } = reply;
+    let q;
+    if (cached && session === cached.session) {
+      q = Object.assign(cached, { route, attempt, history: ids });
+    } else {
+      if (cached) this.asking.delete(cached.session); // the tracker had ended it: start over
+      q = { session, attempt, route, reroutes: 0, history: ids, fed: 0, waiting: null, error: null };
+      this.asking.set(session, q);
+    }
+    const already = q.fed;
     const stop = new Set(stopIds);
     const answer = [];
     const timing = { firstMs: 0, restMs: 0 };
@@ -127,16 +153,32 @@ export class Peer {
         else timing.restMs += ms;
         const finish = stop.has(token) ? "stop" : i === maxNew - 1 ? "length" : null;
         if (!stop.has(token)) answer.push(token);
-        // The answer is complete: save it now, before the session ends.
+        // The answer is complete: save it now, before the session ends or goes idle.
         if (finish && record) this.record(session, record, answer, finish, timing);
-        yield { token, session, route: q.route, reroutes: q.reroutes, ms };
+        yield { token, session, route: q.route, reroutes: q.reroutes, cached: already, ms };
         if (finish === "stop") break;
         q.history.push(token);
       }
     } finally {
-      this.asking.delete(session);
-      if (this.ws.readyState === WebSocket.OPEN) this.send({ type: "end", session });
+      q.waiting = null;
+      if (keep && !q.error && this.ws.readyState === WebSocket.OPEN) {
+        this.chat = q;
+        this.send({ type: "turn", session });
+      } else {
+        this.endSession(session);
+      }
     }
+  }
+
+  // Ends the kept conversation, so the route frees its KV caches.
+  endChat() {
+    if (this.chat) this.endSession(this.chat.session);
+    this.chat = null;
+  }
+
+  endSession(session) {
+    this.asking.delete(session);
+    if (this.ws?.readyState === WebSocket.OPEN) this.send({ type: "end", session });
   }
 
   // Sends the tokens the route hasn't seen yet: the whole history after a
@@ -330,6 +372,11 @@ function makePause() {
     waiting.push(resolve);
     channel.port2.postMessage(0);
   });
+}
+
+function startsWith(ids, prefix, n) {
+  for (let i = 0; i < n; i++) if (ids[i] !== prefix[i]) return false;
+  return true;
 }
 
 async function fetchBytes(url) {

@@ -5,7 +5,7 @@
 //
 //   node swarm/tracker.js [--port 8080] [--host 0.0.0.0] [--weights DIR] [--blocks 0,8,22,30]
 //                         [--tls-cert FILE --tls-key FILE] [--public-url URL]
-//                         [--heartbeat-timeout 5000] [--busy-timeout 20000]
+//                         [--heartbeat-timeout 5000] [--busy-timeout 20000] [--session-idle 600000]
 //
 // With a certificate it serves HTTPS and WSS, which phones on the LAN need:
 // browsers only allow Wake Lock and similar APIs on https:// pages.
@@ -47,6 +47,7 @@ const { values: opts } = parseArgs({
     "public-url": { type: "string" },
     "heartbeat-timeout": { type: "string", default: "5000" },
     "busy-timeout": { type: "string", default: "20000" },
+    "session-idle": { type: "string", default: "600000" },
   },
 });
 
@@ -54,6 +55,7 @@ const boundaries = opts.blocks.split(",").map(Number);
 const blocks = boundaries.slice(0, -1).map((start, index) => ({ index, start, end: boundaries[index + 1] }));
 const HEARTBEAT_TIMEOUT = Number(opts["heartbeat-timeout"]);
 const BUSY_TIMEOUT = Number(opts["busy-timeout"]);
+const SESSION_IDLE = Number(opts["session-idle"]); // a conversation idle this long frees its KV caches
 const MAX_REROUTES = 5; // per session
 
 // Phones cache weights under this version, so re-exported weights replace the cache.
@@ -209,14 +211,55 @@ function assignBlock() {
   return blocks[holders.indexOf(Math.min(...holders))];
 }
 
-// The least-busy ready holder of a block, earliest joined first on a tie.
+// Answers this phone is generating right now; idle conversations don't count.
+function activeSessions(p) {
+  let n = 0;
+  for (const id of p.sessions) if (sessions.get(id)?.active) n++;
+  return n;
+}
+
+// The ready holder of a block that should give a new answer its tokens
+// soonest: its measured time per token (compute plus network), shared with
+// the answers it is already generating. A phone not measured yet counts as
+// the median of its block's measured holders. Earliest joined wins a tie.
 function pickHolder(blockIndex) {
-  let best = null;
-  for (const p of peers.values()) {
-    if (p.block.index !== blockIndex || !p.ready) continue;
-    if (!best || p.sessions.size < best.sessions.size) best = p;
+  const holders = [...peers.values()].filter((p) => p.block.index === blockIndex && p.ready);
+  const measured = holders.map((p) => p.tokenMs).filter((ms) => ms != null).sort((a, b) => a - b);
+  const typical = measured.length ? measured[Math.floor(measured.length / 2)] : 1;
+  let best = null, bestCost = Infinity;
+  for (const p of holders) {
+    const cost = (p.tokenMs ?? typical) * (1 + activeSessions(p));
+    if (cost < bestCost) {
+      best = p;
+      bestCost = cost;
+    }
   }
   return best;
+}
+
+// A session is one conversation. Each answer is a turn; between turns the
+// session stays open, idle, so every phone on the route keeps its KV cache
+// and the next question only sends its new tokens.
+function newTurn(s, now) {
+  Object.assign(s, { active: true, startAt: now, firstAt: 0, lastAt: 0, tokens: 0, recorded: false,
+    cached: s.context ?? 0, hopMs: s.route.map(() => 0), hopN: s.route.map(() => 0) });
+}
+
+// Logs the answer just finished and counts its speed.
+function logAnswer(id, s, why) {
+  if (s.tokens > 1) {
+    finished.push((1000 * (s.tokens - 1)) / (s.lastAt - s.firstAt));
+    if (finished.length > 50) finished.shift();
+  }
+  const name = s.turn > 1 ? `session ${id} turn ${s.turn}` : `session ${id}`;
+  if (s.tokens) {
+    const perToken = s.tokens > 1 ? `, then ${((s.lastAt - s.firstAt) / (s.tokens - 1)).toFixed(0)} ms per token` : "";
+    const hops = s.route.map((pid, i) => `${pid} ${s.hopN[i] ? (s.hopMs[i] / s.hopN[i]).toFixed(0) : "?"} ms`).join(", ");
+    const rerouted = s.reroutes ? ` · rerouted ${s.reroutes}×` : "";
+    log(`${name} ${why ?? "done"}: ${s.tokens} tokens, first token ${secs(s.firstAt - s.startAt)}${perToken} · per hop ${hops}${rerouted}`);
+  } else if (why) {
+    log(`${name} ${why}`);
+  }
 }
 
 function endSession(id, why = null) {
@@ -230,18 +273,8 @@ function endSession(id, why = null) {
     p.owed.delete(id);
     send(p, { type: "drop", session: id });
   }
-  if (s.tokens > 1) {
-    finished.push((1000 * (s.tokens - 1)) / (s.lastAt - s.firstAt));
-    if (finished.length > 50) finished.shift();
-  }
-  if (s.tokens) {
-    const perToken = s.tokens > 1 ? `, then ${((s.lastAt - s.firstAt) / (s.tokens - 1)).toFixed(0)} ms per token` : "";
-    const hops = s.route.map((pid, i) => `${pid} ${s.hopN[i] ? (s.hopMs[i] / s.hopN[i]).toFixed(0) : "?"} ms`).join(", ");
-    const rerouted = s.reroutes ? ` · rerouted ${s.reroutes}×` : "";
-    log(`session ${id} ${why ?? "done"}: ${s.tokens} tokens, first token ${secs(s.firstAt - s.startAt)}${perToken} · per hop ${hops}${rerouted}`);
-  } else if (why) {
-    log(`session ${id} ${why}`);
-  }
+  if (s.active) logAnswer(id, s, why);
+  else if (why) log(`session ${id} ${why}`);
   changed();
 }
 
@@ -279,7 +312,8 @@ function reroute(id, leaver, why) {
 function summary() {
   const holders = blocks.map(() => ({ ready: 0, loading: 0 }));
   for (const p of peers.values()) holders[p.block.index][p.ready ? "ready" : "loading"]++;
-  return JSON.stringify({ type: "swarm", blocks, holders, phones: peers.size, sessions: sessions.size });
+  const answering = [...sessions.values()].filter((s) => s.active).length;
+  return JSON.stringify({ type: "swarm", blocks, holders, phones: peers.size, sessions: answering });
 }
 
 function fullState() {
@@ -305,15 +339,18 @@ function fullState() {
       answers: finished.length,
     },
     peers: [...peers.values()].map((p) => ({
-      id: p.id, block: p.block.index, ready: p.ready, sessions: p.sessions.size, served: p.served,
+      id: p.id, block: p.block.index, ready: p.ready, sessions: activeSessions(p), idleSessions: p.sessions.size - activeSessions(p),
+      served: p.served,
       busy: p.owed.size > 0, silentMs: now - p.lastSeen, joinedAt: p.joinedAt,
       rtt: p.rtt, tokenMs: p.tokenMs, prefillMsPerToken: p.prefillMsPerToken, report: p.report,
       servedPerSec: rate(p.samples, "served", now),
       // Share of wall time spent computing, from the compute time the phone reports.
       utilization: rate(p.samples, "computeMs", now) == null ? null : rate(p.samples, "computeMs", now) / 1000,
     })),
+    sessionIdle: SESSION_IDLE,
     sessions: [...sessions.entries()].map(([id, s]) => ({
       id, asker: s.asker, route: s.route, attempt: s.attempt, reroutes: s.reroutes, context: s.context, tokens: s.tokens,
+      active: s.active, turn: s.turn,
     })),
     events,
     arkiv: arkiv ? arkiv.info() : { enabled: false, reason: ARKIV_OFF },
@@ -342,20 +379,35 @@ function onControl(peer, msg) {
     peer.ready = true;
     log(`${peer.id} ready with block ${peer.block.index + 1}`);
   } else if (msg.type === "ask") {
+    const now = Date.now();
+    const old = sessions.get(msg.session);
+    if (old?.asker === peer.id && !old.active) {
+      // The next question of a conversation: same route, its KV caches still there.
+      old.turn++;
+      newTurn(old, now);
+      send(peer, { type: "session", requestId: msg.requestId, session: msg.session, route: old.route, attempt: old.attempt });
+      log(`session ${msg.session} turn ${old.turn}: ${peer.id} asks again via ${old.route.join(" → ")}, ${old.context} tokens cached`);
+      return changed();
+    }
     const route = blocks.map((b) => pickHolder(b.index));
     const missing = route.indexOf(null);
     if (missing >= 0) {
       return send(peer, { type: "error", requestId: msg.requestId, message: `waiting for block ${missing + 1}: no phone has it ready yet` });
     }
     const id = nextSession++;
-    const now = Date.now();
-    sessions.set(id, {
-      asker: peer.id, route: route.map((p) => p.id), attempt: 0, reroutes: 0, context: 0,
-      startAt: now, firstAt: 0, lastAt: 0, tokens: 0, hopMs: route.map(() => 0), hopN: route.map(() => 0),
-    });
+    const s = { asker: peer.id, route: route.map((p) => p.id), attempt: 0, reroutes: 0, context: 0, turn: 1, idleSince: 0 };
+    newTurn(s, now);
+    sessions.set(id, s);
     for (const p of route) p.sessions.add(id);
-    send(peer, { type: "session", requestId: msg.requestId, session: id, route: route.map((p) => p.id) });
-    log(`session ${id}: ${peer.id} asks via ${route.map((p) => p.id).join(" → ")}`);
+    send(peer, { type: "session", requestId: msg.requestId, session: id, route: s.route, attempt: 0 });
+    log(`session ${id}: ${peer.id} asks via ${s.route.join(" → ")}`);
+  } else if (msg.type === "turn") {
+    // The asker has its answer and keeps the conversation for its next question.
+    const s = sessions.get(msg.session);
+    if (s?.asker !== peer.id || !s.active) return;
+    logAnswer(msg.session, s);
+    s.active = false;
+    s.idleSince = Date.now();
   } else if (msg.type === "end") {
     if (sessions.get(msg.session)?.asker === peer.id) endSession(msg.session);
   } else if (msg.type === "fail") {
@@ -374,7 +426,8 @@ function onControl(peer, msg) {
 
 // The asker's answer finished: save the conversation and this answer's
 // metrics to Arkiv. The metrics are the tracker's own measurements; only a
-// session this phone asked, that produced tokens, is saved, once.
+// session this phone asked, whose answer produced tokens, is saved, once per
+// answer.
 function record(peer, msg) {
   const s = sessions.get(msg.session);
   const reply = (body) => send(peer, { type: "recorded", session: msg.session, chatId: msg.chatId, ...body });
@@ -398,6 +451,7 @@ function record(peer, msg) {
     reroutes: s.reroutes,
     finish: msg.finish === "length" ? "length" : "stop",
     promptTokens: Math.max(0, s.context - s.tokens + 1),
+    cachedTokens: s.cached ?? 0,
     tokens: s.tokens,
     firstTokenMs: s.firstAt - s.startAt,
     msPerToken: s.tokens > 1 ? num((s.lastAt - s.firstAt) / (s.tokens - 1)) : null,
@@ -495,13 +549,16 @@ function onLeave(peer, why = "left") {
 let lastTick = { t: Date.now(), generated: 0 };
 setInterval(() => {
   const now = Date.now();
-  if (sessions.size) {
+  if ([...sessions.values()].some((s) => s.active)) {
     totals.answeringMs += now - lastTick.t;
     totals.generatedWhileAnswering += totals.generated - lastTick.generated;
   }
   lastTick = { t: now, generated: totals.generated };
   sample(swarmSamples, { t: now, generated: totals.generated, served: totals.served });
   for (const peer of peers.values()) sample(peer.samples, { t: now, served: peer.served, computeMs: peer.report?.computeMs ?? null });
+  for (const [id, s] of [...sessions]) {
+    if (!s.active && now - s.idleSince > SESSION_IDLE) endSession(id, `expired after ${secs(now - s.idleSince)} idle`);
+  }
   for (const peer of [...peers.values()]) {
     const limit = peer.owed.size ? BUSY_TIMEOUT : HEARTBEAT_TIMEOUT;
     if (now - peer.lastSeen > limit) {
