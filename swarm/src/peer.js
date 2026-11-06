@@ -24,10 +24,12 @@ import { Tokenizer } from "./tokenizer.js";
 
 export class Peer {
   // readFile(name) -> bytes of one file under the tracker's /weights/.
-  // onEvent(event) gets { type: "swarm" | "progress" | "loaded" | "assign" | "served" | "reroute" | "recorded" | "fatal" | "closed", ... }.
+  // onEvent(event) gets { type: "swarm" | "progress" | "loaded" | "assign" | "served" | "reroute" | "recorded" | "wallet" | "withdrawn" | "fatal" | "closed", ... }.
   // tap(frame) sees every binary frame this phone sends (tests).
-  constructor({ server, readFile = null, onEvent = () => {}, tap = null }) {
+  // role "client" joins without a block: it asks the swarm but serves nothing (swarm/api.js).
+  constructor({ server, readFile = null, onEvent = () => {}, tap = null, role = "phone" }) {
     this.server = server.replace(/\/$/, "");
+    this.role = role;
     this.readFile = readFile ?? ((name) => fetchBytes(`${this.server}/weights/${name}`));
     this.onEvent = onEvent;
     this.tap = tap;
@@ -59,7 +61,7 @@ export class Peer {
       const ws = new WebSocket(this.server.replace(/^http/, "ws") + "/ws");
       ws.binaryType = "arraybuffer";
       this.ws = ws;
-      ws.onopen = () => this.send({ type: "hello" });
+      ws.onopen = () => this.send({ type: "hello", role: this.role });
       ws.onerror = () => reject(new Error(`cannot reach the tracker at ${this.server}`));
       ws.onclose = () => this.closed("Disconnected from the tracker. Reload the page to rejoin.");
       ws.onmessage = (e) => {
@@ -69,6 +71,7 @@ export class Peer {
           this.id = msg.id;
           this.block = msg.block;
           this.weightsVersion = msg.weightsVersion;
+          this.walletChallenge = msg.walletChallenge; // what the page signs to link its wallet
           resolve(msg);
         } else {
           this.onControl(msg);
@@ -92,8 +95,8 @@ export class Peer {
     const { start, end } = block;
     const L = manifest.config.num_layers;
     const files = manifest.layers.slice(start, end);
-    if (start === 0 || end === L) files.push(manifest.embed);
-    if (end === L) files.push(manifest.final_norm);
+    if (start === 0 || (end === L && !manifest.lm_head)) files.push(manifest.embed);
+    if (end === L) files.push(manifest.final_norm, ...(manifest.lm_head ? [manifest.lm_head] : []));
     const total = files.reduce((sum, f) => sum + f.bytes, 0);
     let loaded = 0;
     const readFile = async (name) => {
@@ -120,9 +123,11 @@ export class Peer {
     this.load().catch((err) => this.onEvent({ type: "fatal", message: err.message }));
   }
 
+  // The tokenizer, with the model's chat layout from the manifest.
   async loadTokenizer() {
-    const json = JSON.parse(new TextDecoder().decode(await this.readFile("tokenizer/tokenizer.json")));
-    this.tokenizer = new Tokenizer(json);
+    const text = async (name) => new TextDecoder().decode(await this.readFile(name));
+    const [json, manifest] = await Promise.all([text("tokenizer/tokenizer.json"), text("manifest.json")]);
+    this.tokenizer = new Tokenizer(JSON.parse(json), JSON.parse(manifest).chat ?? undefined);
     return this.tokenizer;
   }
 
@@ -246,6 +251,16 @@ export class Peer {
     });
   }
 
+  // Wallet messages from the page to the tracker: "wallet" links the wallet
+  // this phone earns into, "withdraw" sends its tokens out (src/wallet-auth.js,
+  // src/rewards.js). The answers arrive as "wallet" and "withdrawn" events.
+  sendWallet(msg) {
+    if (this.ws?.readyState !== WebSocket.OPEN) return false;
+    if (msg.type !== "wallet" && msg.type !== "withdraw") return false;
+    this.send(msg);
+    return true;
+  }
+
   close() {
     this.ws?.close();
   }
@@ -299,7 +314,7 @@ export class Peer {
       this.drop(msg.session, msg.attempt);
     } else if (msg.type === "assign") {
       this.reassign(msg.block);
-    } else if (msg.type === "swarm" || msg.type === "recorded") {
+    } else if (msg.type === "swarm" || msg.type === "recorded" || msg.type === "wallet" || msg.type === "withdrawn") {
       this.onEvent(msg);
     }
   }

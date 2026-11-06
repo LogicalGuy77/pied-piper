@@ -46,7 +46,9 @@ def check(name, ok, detail=""):
 
 
 def chat_ids(tokenizer, text):
-    enc = tokenizer.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True)
+    # Thinking off, as on the phones: hybrid models (MiniCPM5, Qwen3) then answer right away.
+    enc = tokenizer.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True,
+                                        enable_thinking=False)
     return list(enc if isinstance(enc, list) else enc["input_ids"])
 
 

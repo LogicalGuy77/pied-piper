@@ -71,8 +71,9 @@ def main():
         strings.append({"text": s, "ids": ids, "decoded": tok.decode(ids)})
     chats = []
     for messages in CHATS:
-        ids = ids_of(tok.apply_chat_template(messages, add_generation_prompt=True))
-        text = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        # Thinking off, as the phones render it (reference/export.py's chat profile).
+        ids = ids_of(tok.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=False))
+        text = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, enable_thinking=False)
         chats.append({"messages": messages, "text": text, "ids": ids})
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

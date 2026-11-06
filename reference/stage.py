@@ -33,8 +33,11 @@ def read_file(weights_dir, entry):
 
     int8 tensors are dequantized here (q * scale per row, in float32), so the
     rest of the engine only ever sees float32.
+
+    The file is memory-mapped, so float32 tensors are views the OS pages in
+    on demand and a 10 GB model can be checked next to Hugging Face's copy.
     """
-    raw = np.fromfile(Path(weights_dir) / entry["file"], dtype=np.uint8)
+    raw = np.memmap(Path(weights_dir) / entry["file"], dtype=np.uint8, mode="r")
     if raw.nbytes != entry["bytes"]:
         raise ValueError(f"{entry['file']}: expected {entry['bytes']} bytes, found {raw.nbytes}")
     tensors = {}

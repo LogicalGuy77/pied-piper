@@ -63,7 +63,7 @@ async function start(server) {
   try {
     const welcome = await peer.connect();
     cache = await openCache(peer.weightsVersion);
-    post({ type: "welcome", id: peer.id, block: peer.block, blocks: welcome.blocks, cached: !!cache });
+    post({ type: "welcome", id: peer.id, block: peer.block, blocks: welcome.blocks, cached: !!cache, walletChallenge: peer.walletChallenge });
     await peer.loadTokenizer();
     post({ type: "tokenizer" });
     await (peer.loading ?? peer.load()); // already loading if the tracker moved it meanwhile
@@ -80,14 +80,13 @@ let conversation = null;
 // messages is the same conversation as text, up to this question, for Arkiv.
 async function ask(text, messages, maxNew, chatId) {
   const tok = peer.tokenizer;
-  const turn = `<|im_start|>user\n${text}<|im_end|>\n<|im_start|>assistant\n`;
-  const ids = conversation ? [...conversation, ...tok.encode(`\n${turn}`)] : tok.chat([{ role: "user", content: text }]);
+  const ids = conversation ? [...conversation, ...tok.encode(tok.turnText(text))] : tok.chat([{ role: "user", content: text }]);
   const decoder = tok.streamDecoder();
   const answer = [];
   let firstMs = 0, restMs = 0, reroutes = 0, cached = 0;
   try {
     const record = chatId ? { chatId, messages } : null;
-    for await (const step of peer.ask(ids, { maxNew, stopIds: [tok.eosId], keep: true, record })) {
+    for await (const step of peer.ask(ids, { maxNew, stopIds: tok.stopIds, keep: true, record })) {
       answer.push(step.token);
       reroutes = step.reroutes;
       cached = step.cached;
@@ -96,8 +95,9 @@ async function ask(text, messages, maxNew, chatId) {
       post({ type: "token", text: decoder.push(step.token), route: step.route, session: step.session });
     }
     post({ type: "token", text: decoder.flush() });
-    conversation = [...ids, ...answer];
-    if (answer.at(-1) !== tok.eosId) conversation.push(tok.eosId);
+    // The route never saw the stop token (it was output, not fed), so the
+    // conversation ends the turn with <|im_end|> whatever token stopped it.
+    conversation = [...ids, ...(tok.stopIds.includes(answer.at(-1)) ? answer.slice(0, -1) : answer), tok.eosId];
     const tokens = answer.length;
     post({ type: "done", tokens, firstMs, msPerToken: tokens > 1 ? restMs / (tokens - 1) : 0, reroutes, cached, prompt: ids.length });
   } catch (err) {
@@ -115,4 +115,5 @@ self.onmessage = ({ data }) => {
   else if (data.type === "ask") ask(data.text, data.messages, data.maxNew, data.chatId);
   else if (data.type === "new-chat") newChat();
   else if (data.type === "stats") peer?.report(data.stats);
+  else if (data.type === "to-tracker") peer?.sendWallet(data.msg);
 };

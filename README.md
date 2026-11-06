@@ -242,34 +242,73 @@ After the MVP:
 - Credits on-chain.
 - Torrent-style weight sharing: a new phone downloads its block from phones that already have it.
 
+## Two models: the big one and the backup
+
+The swarm runs any Llama-architecture model from Hugging Face that
+`reference/export.py` accepts (RMSNorm, RoPE, GQA, SiLU MLP, no biases, a
+byte-level BPE tokenizer with a ChatML chat template). Two are set up:
+
+| | MiniCPM5-2B (the demo) | SmolLM2-135M (the backup) |
+|---|---|---|
+| Model | `openbmb/MiniCPM5-2B`, Sep 2026, Apache-2.0, 2B-class SOTA | `HuggingFaceTB/SmolLM2-135M-Instruct` |
+| Parameters | 2.52B, 42 layers, hidden 2048, 16 Q / 2 KV heads | 135M, 30 layers, hidden 576 |
+| Weights on phones | int8, 2.5 GB in all: 47 MB per layer, 268 MB embedding, 268 MB output layer | float32, 538 MB |
+| `npm start` | 6 blocks: 315–472 MB per phone, two holders each at 12 phones | |
+| `npm run start:3phones` | 3 blocks: 928 · 944 · 645 MB per phone, no spare holders | |
+| `npm run start:small` | | 3 blocks of about 200 MB, as before |
+| Sent per hop | 2048 numbers ≈ 8 KB per token | 576 numbers ≈ 2.3 KB |
+| Checks | float32 export equals Hugging Face: 17/17, 40 of 40 greedy tokens. int8 vs float32: see below | 17/17, 16/16, 35/35 |
+
+MiniCPM5-2B is a hybrid-thinking model; the swarm runs it with thinking off
+(the chat template's `<think>\n\n</think>\n\n` prefix, written into the
+manifest by `export.py`), so answers start right away. Any other flag still
+passes through: `npm start -- --port 8443 --tls-cert … --public-url …`.
+
+Per token, a question costs the same compute whichever way the model is cut
+(blocks run one after another), so three phones are no slower than six, only
+heavier: each has to hold a 650–950 MB block in one tab. Six is the safe
+default; `--min-blocks` and `--min-replica` are the knobs.
+
 ## Run what exists so far
 
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install -r reference/requirements.txt
-.venv/bin/python reference/export.py   # writes weights/ (538 MB)
+
+# The backup model, SmolLM2-135M
+.venv/bin/python reference/export.py   # writes weights/smollm2-135m-instruct/ (538 MB)
 .venv/bin/python reference/check.py    # step 1 checks, writes testvectors/
 .venv/bin/python reference/tokenizer_vectors.py
 (cd engine && npm run check)           # step 2 checks
 cd swarm && npm install
 npm run check                          # step 3 checks (Node 22+)
-npm start                              # then open http://localhost:8080 in 3+ tabs,
+npm run start:small                    # then open http://localhost:8080 in 3+ tabs,
                                        # and /dashboard or /manage on the laptop
 cd ../docker && npm install && npm test   # step 3.5: phones as containers (Docker)
+
+# The demo model, MiniCPM5-2B (5 GB download, 10 GB float32 + 2.5 GB int8 on disk, 24 GB RAM)
+.venv/bin/python reference/export.py --model openbmb/MiniCPM5-2B
+.venv/bin/python reference/export.py --model openbmb/MiniCPM5-2B --dtype int8
+.venv/bin/python reference/check.py --weights weights/minicpm5-2b --testvectors testvectors-minicpm5-2b
+.venv/bin/python reference/check_int8.py --weights weights/minicpm5-2b-int8 --float32 weights/minicpm5-2b \
+    --testvectors testvectors-minicpm5-2b-int8
+.venv/bin/python reference/tokenizer_vectors.py --weights weights/minicpm5-2b-int8 \
+    --out testvectors-minicpm5-2b-int8/tokenizer.json
+(cd engine && npm run check:big)
+cd swarm && npm run check:big
+npm start                              # 6 blocks; or npm run start:3phones
 ```
 
-`weights/` and `testvectors/` are generated and not committed.
+`weights/` and `testvectors*/` are generated and not committed.
 
-### int8 weights (experimental, not the default)
+### int8 weights
 
 `reference/export.py --dtype int8` stores every matrix as int8 with one
-float32 scale per row: a quarter of the download (57 MB for blocks 1 and 3,
-50 MB for block 2). `reference/check_int8.py` compares it with float32 and
-writes `testvectors-int8/`; `npm run check:int8` in `engine/` runs the JS
-checks on it, and `node tracker.js --weights ../weights/smollm2-135m-instruct-int8`
-serves it.
+float32 scale per row (the same round-to-nearest family as llama.cpp's
+`Q8_0`). `reference/check_int8.py` compares it with the float32 export and
+writes test vectors for the JS engine.
 
-It is not good enough for this 135M model: on longer questions it picks
+For SmolLM2-135M it is not good enough: on longer questions it picks
 float32's next token 194 times out of 198, but on short chats like "hi" it
-never emits `<|im_end|>` and repeats itself until the token limit. Bigger
-models quantize far better; this format is groundwork for them.
+never emits `<|im_end|>` and repeats itself. MiniCPM5-2B is the model it was
+groundwork for; `npm run start:small` keeps the 135M in float32.

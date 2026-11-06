@@ -21,6 +21,14 @@
 // With ARKIV_PRIVATE_KEY in swarm/.env, every finished conversation and its
 // metrics are saved to Arkiv's Rabdi testnet (src/arkiv.js), and /arkiv shows
 // what is there.
+//
+// Rewards: every phone gets a wallet with no sign-up (a Privy guest wallet,
+// with PRIVY_APP_ID; otherwise one kept in the browser), proves it holds it
+// by signing a challenge (src/wallet-auth.js), and earns PIPER for
+// the layer-tokens it serves (src/rewards.js). With TREASURY_PRIVATE_KEY and
+// a deployed token (chain/deploy.js), the treasury pays out on Unichain
+// Sepolia every --payout-every ms, and submits withdrawals for phones.
+//   [--reward 0.001] PIPER per layer-token   [--payout-min 0.01]   [--payout-every 60000]
 
 import { createHash } from "node:crypto";
 import { createReadStream, readdirSync, readFileSync, statSync } from "node:fs";
@@ -35,6 +43,8 @@ import { WebSocketServer } from "ws";
 import { createArkivStore, describeError } from "./src/arkiv.js";
 import { costModel, initialCut, placeJoin, repairMove, splitPoint } from "./src/blocks.js";
 import { KIND, readHeader } from "./src/protocol.js";
+import { createRewards } from "./src/rewards.js";
+import { newNonce, verifyWallet, walletChallenge } from "./src/wallet-auth.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -56,6 +66,10 @@ const { values: opts } = parseArgs({
     "heartbeat-timeout": { type: "string", default: "5000" },
     "busy-timeout": { type: "string", default: "20000" },
     "session-idle": { type: "string", default: "600000" },
+    reward: { type: "string", default: "0.001" },
+    "payout-min": { type: "string", default: "0.01" },
+    "payout-every": { type: "string", default: "60000" },
+    ledger: { type: "string", default: join(ROOT, "swarm", "data", "rewards.json") },
   },
 });
 
@@ -111,6 +125,27 @@ try {
 }
 const ARKIV_OFF = "Arkiv is off: set ARKIV_PRIVATE_KEY in swarm/.env and restart the tracker";
 
+// The token is PIPER_TOKEN, or the one chain/deploy.js deployed.
+const PRIVY_APP_ID = process.env.PRIVY_APP_ID?.trim() || null;
+let deployment = null;
+try {
+  deployment = JSON.parse(readFileSync(join(ROOT, "swarm", "chain", "deployment.json"), "utf8"));
+} catch {}
+const treasuryKey = process.env.TREASURY_PRIVATE_KEY?.trim() || null;
+const tokenAddress = process.env.PIPER_TOKEN?.trim() || deployment?.token || null;
+const rewards = createRewards({
+  file: resolve(opts.ledger),
+  rewardPerLayerToken: opts.reward,
+  payoutMin: opts["payout-min"],
+  chain: treasuryKey && tokenAddress
+    ? { privateKey: treasuryKey, token: tokenAddress, rpcUrl: process.env.CHAIN_RPC_URL?.trim() || undefined }
+    : null,
+  log: (line) => log(line),
+});
+const PAYOUTS_OFF = !treasuryKey
+  ? "set TREASURY_PRIVATE_KEY in swarm/.env"
+  : "deploy the token first: node swarm/chain/deploy.js";
+
 // --- HTTP: the page, the code it imports, and the weights ---
 
 // URL prefix -> directory. The browser sees the same layout as the repo, so
@@ -139,6 +174,19 @@ function serveStatic(req, res) {
     qr.make();
     res.writeHead(200, { "content-type": TYPES[".svg"], "cache-control": "no-cache" });
     return res.end(qr.createSvgTag({ cellSize: 8, margin: 2, scalable: true }));
+  }
+  if (path === "/wallet/config") {
+    const info = rewards.info();
+    return sendJson(res, {
+      privyAppId: PRIVY_APP_ID,
+      payouts: info.payouts,
+      payoutsOff: info.payouts ? null : PAYOUTS_OFF,
+      token: info.token,
+      explorer: info.explorer,
+      reward: info.rewardPerLayerToken,
+      payoutMin: info.payoutMin,
+      payoutEvery: Number(opts["payout-every"]),
+    });
   }
   if (path === "/arkiv/info") return sendJson(res, arkiv ? arkiv.info() : { enabled: false, reason: ARKIV_OFF });
   if (path === "/arkiv/entities") {
@@ -420,9 +468,14 @@ function connectWaiting() {
 // the square of the number of phones.
 function summary() {
   const holders = blocks.map(() => ({ ready: 0, loading: 0 }));
-  for (const p of peers.values()) holders[p.block.index][p.ready ? "ready" : "loading"]++;
+  let phones = 0;
+  for (const p of peers.values()) {
+    if (!p.block) continue; // a client
+    holders[p.block.index][p.ready ? "ready" : "loading"]++;
+    phones++;
+  }
   const answering = [...sessions.values()].filter((s) => s.active).length;
-  return JSON.stringify({ type: "swarm", blocks, holders, phones: peers.size, sessions: answering });
+  return JSON.stringify({ type: "swarm", blocks, holders, phones, sessions: answering });
 }
 
 function fullState() {
@@ -447,9 +500,10 @@ function fullState() {
       perAnswer: finished.length ? finished.reduce((a, b) => a + b, 0) / finished.length : null,
       answers: finished.length,
     },
-    peers: [...peers.values()].map((p) => ({
+    clients: [...peers.values()].filter((p) => !p.block).map((p) => p.id),
+    peers: [...peers.values()].filter((p) => p.block).map((p) => ({
       id: p.id, block: p.block.index, ready: p.ready, sessions: activeSessions(p), idleSessions: p.sessions.size - activeSessions(p),
-      served: p.served,
+      served: p.served, wallet: p.wallet, earned: p.wallet ? rewards.status(p.wallet) : null,
       busy: p.owed.size > 0, silentMs: now - p.lastSeen, joinedAt: p.joinedAt,
       rtt: p.rtt, tokenMs: p.tokenMs, prefillMsPerToken: p.prefillMsPerToken, report: p.report,
       servedPerSec: rate(p.samples, "served", now),
@@ -534,6 +588,10 @@ function onControl(peer, msg) {
     peer.report = { ...msg.stats, at: Date.now() };
   } else if (msg.type === "record") {
     return record(peer, msg);
+  } else if (msg.type === "wallet") {
+    return bindWallet(peer, msg);
+  } else if (msg.type === "withdraw") {
+    return withdraw(peer, msg);
   }
   changed();
 }
@@ -590,6 +648,61 @@ function record(peer, msg) {
 
 const short = (hex) => `${hex.slice(0, 8)}…${hex.slice(-4)}`;
 
+// --- Rewards ---
+
+// A phone earns from its first token served; until its wallet is known the
+// layer-tokens wait on the connection, then go to the wallet.
+function earn(peer, layerTokens) {
+  if (peer.wallet) rewards.credit(peer.wallet, layerTokens);
+  else peer.unearned += layerTokens;
+}
+
+// The phone proves which wallet it holds (src/wallet-auth.js); from then on
+// it earns into that wallet.
+async function bindWallet(peer, msg) {
+  let address;
+  try {
+    address = await verifyWallet(msg, { peerId: peer.id, nonce: peer.walletNonce });
+  } catch (err) {
+    return send(peer, { type: "wallet", error: `wallet not linked: ${err.message}` });
+  }
+  if (!peers.has(peer.id)) return;
+  const changedWallet = peer.wallet !== address;
+  peer.wallet = address;
+  if (peer.unearned) rewards.credit(peer.wallet, peer.unearned);
+  peer.unearned = 0;
+  if (changedWallet) log(`${peer.id} earns into ${msg.kind === "privy" ? "Privy wallet" : "browser wallet"} ${short(peer.wallet)}`);
+  peer.walletSent = null;
+  await rewards.refresh(peer.wallet);
+  pushWallet(peer);
+  changed();
+}
+
+async function withdraw(peer, msg) {
+  const reply = (body) => send(peer, { type: "withdrawn", requestId: msg.requestId, ...body });
+  if (!peer.wallet) return reply({ error: "this phone has no wallet yet" });
+  try {
+    reply({ hash: await rewards.withdraw(peer.wallet, msg) });
+  } catch (err) {
+    reply({ error: err.shortMessage ?? err.message });
+  }
+  for (const p of peers.values()) if (p.wallet === peer.wallet) pushWallet(p);
+}
+
+// Sends a phone its wallet's numbers when they change.
+function pushWallet(peer) {
+  if (!peer.wallet) return;
+  const msg = JSON.stringify({ type: "wallet", ...rewards.status(peer.wallet) });
+  if (msg === peer.walletSent) return;
+  peer.walletSent = msg;
+  if (peer.ws.readyState === 1) peer.ws.send(msg);
+}
+
+async function payoutRound() {
+  const paid = new Set(await rewards.payout());
+  for (const p of peers.values()) if (paid.has(p.wallet)) pushWallet(p);
+}
+
 // [{ role, content }] with known roles and string contents, or null.
 function cleanMessages(messages) {
   if (!Array.isArray(messages) || !messages.length || messages.length > 500) return null;
@@ -626,6 +739,7 @@ function onFrame(peer, data) {
       } else {
         peer.prefillMsPerToken = ewma(peer.prefillMsPerToken, ms / owed.n);
       }
+      earn(peer, owed.n * cost(peer.block));
     }
   }
   const to = peers.get(h.hop < s.route.length ? s.route[h.hop] : s.asker);
@@ -647,7 +761,7 @@ function onFrame(peer, data) {
 function onLeave(peer, why = "left") {
   if (!peers.has(peer.id)) return;
   peers.delete(peer.id);
-  log(`${peer.id} ${why} (block ${peer.block.index + 1})`);
+  log(`${peer.id} ${why} (${peer.block ? `block ${peer.block.index + 1}` : "client"})`);
   for (const [id, s] of [...sessions]) if (s.asker === peer.id) endSession(id, `ended: asker ${peer.id} ${why}`);
   // Refill its block first, so the answers it was serving can wait for the
   // phone moving in instead of failing.
@@ -690,8 +804,20 @@ setInterval(() => {
       peer.ws.ping();
     }
   }
+  for (const peer of peers.values()) pushWallet(peer);
   if (watchers.size) changed(); // pings and silences move even when nothing else does
 }, 1000).unref();
+
+rewards.init().then(
+  () => setInterval(payoutRound, Number(opts["payout-every"])).unref(),
+  (err) => log(`payouts are off: reading the token failed: ${err.shortMessage ?? err.message}`),
+);
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    rewards.flush();
+    process.exit(0);
+  });
+}
 
 const tls = opts["tls-cert"] ? { cert: readFileSync(opts["tls-cert"]), key: readFileSync(opts["tls-key"]) } : null;
 const server = tls ? createTlsServer(tls, serveStatic) : createServer(serveStatic);
@@ -713,12 +839,15 @@ wss.on("connection", (ws) => {
       peer = {
         id: peerName(joined++), ws, block: null, ready: false, sessions: new Set(), served: 0, lastSeen: Date.now(), joinedAt: Date.now(),
         owed: new Map(), rtt: null, pingAt: null, tokenMs: null, prefillMsPerToken: null, report: null, summary: null, samples: [],
+        wallet: null, walletNonce: newNonce(), walletSent: null, unearned: 0,
       };
-      placeNewPhone(peer);
+      // A client (swarm/api.js) asks like a phone but holds no block, so it
+      // is never placed, routed to, split or moved: holdersOf() skips it.
+      if (msg.role !== "client") placeNewPhone(peer);
       peers.set(peer.id, peer);
       const { block } = peer;
-      send(peer, { type: "welcome", id: peer.id, block, blocks, weightsVersion });
-      log(`${peer.id} joined, holds block ${block.index + 1} (layers ${block.start}–${block.end - 1})`);
+      send(peer, { type: "welcome", id: peer.id, block, blocks, weightsVersion, walletChallenge: walletChallenge(peer.id, peer.walletNonce) });
+      log(block ? `${peer.id} joined, holds block ${block.index + 1} (layers ${block.start}–${block.end - 1})` : `${peer.id} joined as a client`);
     } else if (msg.type === "watch" && !peer) {
       watchers.add(ws);
       ws.send(fullState());
@@ -747,4 +876,8 @@ server.listen(Number(opts.port), opts.host, () => {
   console.log(`  management: ${scheme}://localhost:${port}/manage`);
   console.log(`  blocks: ${blocks.map(range).join(" ")}, at least ${MIN_REPLICA} phone${MIN_REPLICA > 1 ? "s" : ""} each before splitting`);
   console.log(arkiv ? `  arkiv: saving conversations as ${arkiv.address} on Rabdi, see ${scheme}://localhost:${port}/arkiv` : `  ${ARKIV_OFF}`);
+  console.log(`  wallets: ${PRIVY_APP_ID ? `Privy app ${PRIVY_APP_ID}` : "kept in each browser (set PRIVY_APP_ID for Privy guest wallets)"}`);
+  console.log(treasuryKey && tokenAddress
+    ? `  rewards: ${opts.reward} PIPER per layer-token, paid from the treasury every ${secs(Number(opts["payout-every"]))}, token ${tokenAddress}`
+    : `  rewards: counted in ${opts.ledger}; payouts off: ${PAYOUTS_OFF}`);
 });

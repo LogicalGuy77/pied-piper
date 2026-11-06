@@ -7,13 +7,26 @@
     "node": ">=22"
   },
   "scripts": {
-    "start": "node tracker.js",
-    "check": "node test/check.js"
+    "start": "node tracker.js --weights ../weights/minicpm5-2b-int8 --min-blocks 6",
+    "start:3phones": "node tracker.js --weights ../weights/minicpm5-2b-int8 --min-blocks 3",
+    "start:small": "node tracker.js",
+    "api": "node api.js",
+    "build": "node wallet/build.js",
+    "check": "node test/check.js",
+    "check:big": "node test/check.js ../weights/minicpm5-2b-int8 ../testvectors-minicpm5-2b-int8"
   },
   "dependencies": {
     "@arkiv-network/sdk": "^1.0.1",
     "qrcode-generator": "^1.4.4",
     "viem": "^2.57.16",
     "ws": "8.22.1"
+  },
+  "devDependencies": {
+    "@openzeppelin/contracts": "^5.6.1",
+    "@privy-io/react-auth": "^3.51.3",
+    "esbuild": "^0.28.2",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "solc": "^0.8.28"
   }
 }

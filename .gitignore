@@ -1,9 +1,10 @@
 .venv/
 __pycache__/
 weights/
-testvectors/
-testvectors-int8/
+testvectors*/
 node_modules/
 docker/certs/
 certs/
 .env
+swarm/web/dist/
+swarm/data/

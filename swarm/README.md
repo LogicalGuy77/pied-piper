@@ -12,13 +12,20 @@ Needs Node 22+ and the outputs of step 1 (`weights/` and `testvectors/`):
 ```sh
 .venv/bin/python reference/tokenizer_vectors.py   # once: tokenizer ids for the checks
 cd swarm && npm install
-npm run check      # 45 checks, under a minute
-npm start          # tracker on http://localhost:8080; --min-blocks 3 --min-replica 2 by default
+npm run check          # 45 checks on SmolLM2-135M, under a minute
+npm run check:big      # the same on MiniCPM5-2B int8 (needs its export and test vectors, see the top-level README)
+npm run start:small    # SmolLM2-135M, 3 blocks: tracker on http://localhost:8080
+npm start              # MiniCPM5-2B int8, 6 blocks (315–472 MB per phone)
+npm run start:3phones  # MiniCPM5-2B int8, 3 blocks (650–950 MB per phone)
 ```
 
-Then open `http://localhost:8080` in three or more tabs. The first three tabs
-get blocks 1, 2 and 3; with `npm start -- --min-replica 1`, a fourth tab
-splits block 2. Ask a question in any tab. The answer to "Explain in
+The tracker itself is `node tracker.js [--weights DIR] [--min-blocks 3]
+[--min-replica 2] ...`; the npm scripts only pick the weights and the cut,
+and pass any other flag through (`npm start -- --port 8443 ...`).
+
+Then open `http://localhost:8080` in as many tabs as there are blocks. The
+first tabs get one block each; with `--min-replica 1`, the next tab splits
+the largest block. Ask a question in any tab. The answer to "Explain in
 two sentences why the sky is blue." should start with the same text as
 `reference/chat.py`.
 
@@ -34,12 +41,13 @@ Phones need an `https://` page. Two ways that work:
 - **Cloudflare quick tunnel**, any network, a real certificate:
   ```sh
   cloudflared tunnel --url https://localhost:8443 --no-tls-verify   # prints https://….trycloudflare.com
-  node tracker.js --port 8443 --tls-cert ../certs/lan.crt --tls-key ../certs/lan.key \
-    --public-url https://….trycloudflare.com
+  npm start -- --port 8443 --tls-cert ../certs/lan.crt --tls-key ../certs/lan.key \
+    --public-url https://….trycloudflare.com                        # or start:small, start:3phones
   ```
-  The laptop needs a fast uplink: each phone downloads its 200 MB block
-  through it once. Over venue Wi-Fi (0.6 MB/s) that took half an hour; over
-  Ethernet, 20 seconds. The address changes every time cloudflared restarts.
+  The laptop needs a fast uplink: each phone downloads its block through it
+  once (200 MB for the small model, 300–950 MB for the big one). Over venue
+  Wi-Fi (0.6 MB/s) 200 MB took half an hour; over Ethernet, 20 seconds. The
+  address changes every time cloudflared restarts.
 - **Same network**, faster: a self-signed certificate for the laptop's IP
   (`openssl req -x509 … -addext "subjectAltName=IP:<laptop IP>"`), accepted
   once on each phone. Phone hotspots and venue Wi-Fi often block devices

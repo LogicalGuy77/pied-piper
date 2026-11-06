@@ -12,7 +12,9 @@
 import { KERNELS_WASM } from "./kernels-wasm.js";
 
 const PAGE = 65536;
-const align16 = (n) => (n + 15) & ~15;
+// Not (n + 15) & ~15: JS bitwise ops are signed 32-bit, and an arena holding
+// more than 2 GB (a whole 2B model in one stage) has offsets past that.
+const align16 = (n) => Math.ceil(n / 16) * 16;
 
 let compiled = null;
 function kernelModule() {

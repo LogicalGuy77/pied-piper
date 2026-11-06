@@ -71,6 +71,7 @@ worker.onmessage = ({ data: e }) => {
     $("title").textContent = `Phone ${e.id} · Block ${e.block.index + 1}`;
     $("status").textContent = `Holds ${blockLabel(e.block)}. Loading its weights…`;
     renderSwarm();
+    startWallet(e.walletChallenge);
   } else if (e.type === "assign") {
     // The swarm rebalanced: a block split, or one lost its phones.
     myBlock = e.block.id;
@@ -118,6 +119,8 @@ worker.onmessage = ({ data: e }) => {
     finishAsk();
   } else if (e.type === "recorded") {
     showRecorded(e);
+  } else if (e.type === "wallet" || e.type === "withdrawn") {
+    wallet ? wallet.update(e) : walletEvents.push(e);
   } else if (e.type === "error") {
     messages.pop(); // the question didn't get an answer; don't keep it in the conversation
     answerEl.classList.add("error");
@@ -233,6 +236,24 @@ async function openArkiv(show) {
   $("arkiv").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 $("peek").addEventListener("click", () => openArkiv($("arkiv").hidden));
+
+// --- Earnings: this phone's wallet (swarm/wallet/, built to dist/) ---
+
+let wallet = null;
+const walletEvents = []; // from the tracker before the wallet card is up
+
+async function startWallet(challenge) {
+  try {
+    const config = await (await fetch("/wallet/config")).json();
+    const { mountWallet } = await import("./dist/wallet.js");
+    $("wallet").classList.remove("muted");
+    const send = (msg) => worker.postMessage({ type: "to-tracker", msg });
+    wallet = await mountWallet($("wallet"), { config, challenge, send });
+    for (const e of walletEvents.splice(0)) wallet.update(e);
+  } catch (err) {
+    $("wallet").textContent = `No wallet: ${err.message}. Build it with: cd swarm && npm run build`;
+  }
+}
 
 // --- Staying awake ---
 // A phone whose screen turns off stops answering and is dropped. The lock

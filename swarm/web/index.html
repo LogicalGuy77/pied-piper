@@ -54,6 +54,13 @@
     .stats.bad { color: var(--bad); }
     a { color: var(--accent); }
     button.linkish { background: none; border: 0; padding: 0; color: var(--accent); font-size: inherit; font-weight: inherit; text-decoration: underline; }
+    .wallet-balance { font-size: 15px; }
+    .wallet-amount { font: 600 24px ui-monospace, monospace; }
+    .note.bad { color: var(--bad); }
+    .wallet-key { display: block; margin-top: 6px; font-size: 11px; overflow-wrap: anywhere; user-select: all; }
+    .wallet-withdraw { flex-wrap: wrap; }
+    .wallet-withdraw input { flex: 1 1 140px; min-width: 0; font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+    .wallet-withdraw .note { flex-basis: 100%; margin-top: 0; }
     @media (max-width: 480px) { .blocks { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -64,6 +71,11 @@
     <div id="status" class="muted">Connecting to the tracker</div>
     <div class="bar"><div id="progress"></div></div>
     <div id="awake" class="note"></div>
+  </section>
+
+  <section class="card">
+    <h2>Earnings</h2>
+    <div id="wallet" class="muted">Setting up this phone's wallet…</div>
   </section>
 
   <section class="card">

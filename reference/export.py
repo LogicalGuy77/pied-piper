@@ -86,6 +86,66 @@ def model_config(raw):
     }
 
 
+def chat_profile(tokenizer):
+    """How this model's chat template lays out a conversation, for the browser tokenizer.
+
+    swarm/src/tokenizer.js renders ChatML itself (no Jinja on the phone), so
+    this renders the Hugging Face template on probe conversations and reads
+    off the pieces that differ between models: the text before everything
+    (a BOS token, say), the default system message if the template adds one,
+    and what follows "<|im_start|>assistant\\n", both when generating and in
+    past turns (hybrid-thinking models put an empty think block there).
+    Thinking is switched off, so the swarm's answers start right away.
+    """
+    def render(messages):
+        return tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, enable_thinking=False)
+
+    def turn(role, content):
+        return f"<|im_start|>{role}\n{content}<|im_end|>\n"
+
+    user, open_assistant = turn("user", "Q?"), "<|im_start|>assistant\n"
+    core = user + open_assistant
+
+    def fail(what):
+        raise SystemExit(f"Cannot export this model: its chat template is not ChatML ({what}), "
+                         "so swarm/src/tokenizer.js could not render it")
+
+    one = render([{"role": "user", "content": "Q?"}])
+    i = one.find(core)
+    if i < 0:
+        fail("no user turn followed by an assistant turn")
+    head, assistant_prefix = one[:i], one[i + len(core):]
+
+    with_system = render([{"role": "system", "content": "S."}, {"role": "user", "content": "Q?"}])
+    j = with_system.find(turn("system", "S.") + core)
+    if j < 0 or with_system[j + len(turn("system", "S.") + core):] != assistant_prefix:
+        fail("a system message is not rendered as a system turn")
+    bos = with_system[:j]
+    if not head.startswith(bos):
+        fail("the text before the first turn changes with a system message")
+    default_system = head[len(bos):]
+    if default_system:
+        if not (default_system.startswith("<|im_start|>system\n") and default_system.endswith("<|im_end|>\n")):
+            fail("the default system message is not a system turn")
+        default_system = default_system[len("<|im_start|>system\n"):-len("<|im_end|>\n")]
+
+    history = render([{"role": "user", "content": "Q?"}, {"role": "assistant", "content": "A."},
+                      {"role": "user", "content": "R?"}])
+    k = history.find(core)
+    tail = "A.<|im_end|>\n" + turn("user", "R?") + open_assistant + assistant_prefix
+    if k < 0 or not history.endswith(tail):
+        fail("a past assistant turn is not rendered as an assistant turn")
+    history_prefix = history[k + len(core):-len(tail)]
+
+    return {
+        "format": "chatml",
+        "bos": bos,
+        "system": default_system or None,
+        "assistant_prefix": assistant_prefix,
+        "assistant_history_prefix": history_prefix,
+    }
+
+
 def quantize_rows(w):
     """Symmetric int8 per row: returns (q int8 [rows, cols], scale float32 [rows])."""
     w = np.asarray(w, dtype=np.float32)
@@ -136,10 +196,15 @@ def main():
     ap.add_argument("--out", type=Path, help="output directory (default: weights/<model>[-int8])")
     args = ap.parse_args()
     if args.out is None:
-        args.out = DEFAULT_OUT_INT8 if args.dtype == "int8" else DEFAULT_OUT
+        name = args.model.rstrip("/").split("/")[-1].lower()
+        args.out = ROOT / "weights" / (name + ("-int8" if args.dtype == "int8" else ""))
     dtype = args.dtype
 
     config = model_config(read_raw_config(args.model))
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    chat = chat_profile(tokenizer)
+    eos = config["eos_token_id"]
+    chat["stop_ids"] = sorted({*(eos if isinstance(eos, list) else [eos]), tokenizer.convert_tokens_to_ids("<|im_end|>")})
     print(f"Loading {args.model} in float32 ...")
     sd = load_hf_model(args.model).state_dict()
 
@@ -167,13 +232,14 @@ def main():
                   + ("; int8 tensors are q[out, in] then float32 scale[out], W = q * scale[:, None]"
                      if dtype == "int8" else ""),
         "config": config,
+        "chat": chat,  # the chat template's ChatML pieces, for swarm/src/tokenizer.js
         "embed": embed,
         "final_norm": final_norm,
         "lm_head": lm_head,  # null means the output layer reuses the embedding table
         "layers": layers,
     }
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    AutoTokenizer.from_pretrained(args.model).save_pretrained(args.out / "tokenizer")
+    tokenizer.save_pretrained(args.out / "tokenizer")
 
     mb = 1e6
     total = sum(e["bytes"] for e in [embed, final_norm, *layers] + ([lm_head] if lm_head else []))
