@@ -32,7 +32,7 @@
            border: 1px solid var(--line); background: var(--bg); color: var(--text); }
     .totals { display: flex; gap: 18px; margin-top: 12px; }
     .totals b { font-size: 22px; display: block; }
-    .blocks { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .blocks { display: grid; grid-template-columns: repeat(var(--n, 3), 1fr); gap: 10px; }
     .block { border-radius: 10px; padding: 10px; border: 1px solid; min-height: 120px; }
     .block[data-b="0"] { background: var(--b1); border-color: var(--b1s); }
     .block[data-b="1"] { background: var(--b2); border-color: var(--b2s); }

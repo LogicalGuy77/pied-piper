@@ -216,8 +216,10 @@ try {
 
   console.log("7. A phone reloads its page: weights from its cache");
   {
-    // The only holder left of block 2, so it gets block 2 again when it rejoins.
-    const p = holders(2)[0];
+    // Block 1's other phone. Leaving takes block 1 down to one phone like the
+    // others, so nobody moves, and it gets block 1 back when it rejoins: the
+    // first block with the fewest phones.
+    const p = holders(1).find((x) => x !== asker);
     const t = Date.now();
     await p.page.reload();
     const status = await p.page.waitForFunction(() => {
@@ -229,7 +231,7 @@ try {
     p.block = Number(p.block);
     byId[p.id] = p;
     alive.add(p.id);
-    check("it rejoins with its block read from the browser's cache", p.block === 2 && status.includes("from this phone's cache"),
+    check("it rejoins with its block read from the browser's cache", p.block === 1 && status.includes("from this phone's cache"),
       `serving again as ${p.id} after ${secs(Date.now() - t)}: ${JSON.stringify(status)}`);
   }
 

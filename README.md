@@ -13,10 +13,12 @@ question travels through one holder of each block.
 
 ## The swarm
 
-The laptop runs the **tracker**. When a phone joins, the tracker gives it the
-block with the fewest holders, and the phone downloads only that block's
-weights. The whole model is over the 300 MB we allow one browser tab, so no
-single phone could run it alone.
+The laptop runs the **tracker**. When a phone joins, the tracker gives it a
+block, and the phone downloads only that block's weights. The whole model is
+over the 300 MB we allow one browser tab, so no single phone could run it
+alone. The first phones make one whole path, the next ones back up every
+block, and after that more phones split the slowest block in two
+([rebalancing](#rebalancing)).
 
 ```mermaid
 flowchart TB
@@ -26,12 +28,12 @@ flowchart TB
         D["D"]
         G["G"]
     end
-    subgraph B2["Block 2 · layers 8–21 · 198.2 MB"]
+    subgraph B2["Block 2 · layers 8–22 · 212.4 MB"]
         B["B"]
         E["E"]
         H["H"]
     end
-    subgraph B3["Block 3 · layers 22–29 + output · 226.5 MB"]
+    subgraph B3["Block 3 · layers 23–29 + output · 212.4 MB"]
         C["C"]
         F["F"]
         I["I"]
@@ -48,8 +50,9 @@ flowchart TB
     class C,F,I b3
 ```
 
-Nine phones, three blocks, three holders each. Every phone also has a chat
-box, so the phones serving blocks are the same ones asking questions.
+Nine phones, three blocks, three holders each (with `--min-replica 3`). Every
+phone also has a chat box, so the phones serving blocks are the same ones
+asking questions.
 
 ## How a question travels
 
@@ -86,8 +89,8 @@ phones send to each other directly.
 1. **E** types a question. Its tokenizer turns the text into token ids.
 2. The tracker picks a route: the fastest available holder of each block, here **D**, **H** and **C**.
 3. **D** looks up the embedding for every token of the question at once, runs layers 0–7, and sends h on.
-4. **H** runs layers 8–21 and sends h on.
-5. **C** runs layers 22–29, then the output layer, which picks the next token.
+4. **H** runs layers 8–22 and sends h on.
+5. **C** runs layers 23–29, then the output layer, which picks the next token.
 6. **E** shows the token and sends it back through the same route. Each phone
    on the route keeps a KV cache for E's session, so after the first pass only
    the one new token travels, never the whole conversation.
@@ -104,7 +107,7 @@ Every phone does two jobs at the same time. Here is phone E, which holds block 2
 ```mermaid
 flowchart TB
     IN["h in · from previous phone"] --> H0
-    subgraph LOOP["repeats for each layer this phone holds (layers 8–21)"]
+    subgraph LOOP["repeats for each layer this phone holds (layers 8–22)"]
         H0(("h")) --> N1["RMSNorm"] --> ATT["Attention"] --> ADD1(("+"))
         ATT <--> KV[("KV cache<br/>one per session,<br/>stays on this phone")]
         H0 -.->|add back| ADD1
@@ -130,17 +133,45 @@ computes for others.
 
 ## The three blocks
 
-| Block | Holds | Weights | Extra job |
-|---|---|---|---|
-| 1 | embedding + layers 0–7 | 226.5 MB | token ids → h |
-| 2 | layers 8–21 | 198.2 MB | none |
-| 3 | layers 22–29 + output | 226.5 MB | h → next token |
+| Block | Holds | Weights | Compute per token | Extra job |
+|---|---|---|---|---|
+| 1 | embedding + layers 0–7 | 226.5 MB | 8 layers | token ids → h |
+| 2 | layers 8–22 | 212.4 MB | 15 layers | none |
+| 3 | layers 23–29 + output | 212.4 MB | 15 layers | h → next token |
 
 Blocks 1 and 3 both carry the 113 MB embedding table, because the model reuses
-it as its output layer, so they get fewer layers. Each phone also keeps a KV
-cache for every active session: about 1.5 KB per token per layer, so a
-1,000-token chat takes about 21 MB on block 2. Sizes are float32 for v1.
+it as its output layer, so they get fewer layers. The tracker cuts the layers
+this way by itself, balancing memory (`--min-blocks 3`). Each phone also keeps
+a KV cache for every active session: about 1.5 KB per token per layer, so a
+1,000-token chat takes about 23 MB on block 2. Sizes are float32 for v1.
 Switching to int8 later cuts the weights to a quarter.
+
+## Rebalancing
+
+Phones come and go, so the tracker keeps reshaping the blocks, with two
+settings: `--min-blocks` (3) and `--min-replica` (2). A joining phone goes:
+
+1. to a block nobody holds, until there is one whole path of `min-blocks` blocks;
+2. else to a block with fewer than `min-replica` phones, so a phone leaving doesn't cut answers;
+3. else to the block with the most compute, as one more replica. The phone that
+   brings it to 2 × `min-replica` splits it in two at its compute midpoint
+   instead: `min-replica` phones per half, so each token costs each phone less.
+
+| Phones | Blocks (phones on each) |
+|---|---|
+| 3 | 0–7 (1) · 8–22 (1) · 23–29 + output (1) |
+| 6 | 0–7 (2) · 8–22 (2) · 23–29 + output (2) |
+| 7 | 0–7 (2) · 8–22 (**3**) · 23–29 + output (2) |
+| 8 | 0–7 (2) · **8–14 (2) · 15–22 (2)** · 23–29 + output (2) |
+| 10 | 0–7 (2) · 8–14 (2) · 15–22 (2) · **23–28 (2) · 29 + output (2)** |
+
+The output layer counts as 8 layers of compute, so block 3 is as slow as
+block 2 despite having fewer layers. Phones on a block that splits already
+have both halves' weights, so they reload from their own cache and only the
+new phone downloads anything. When a phone leaves, a block nobody holds takes
+a phone from the block with the most, and a block below `min-replica` takes
+one from a block above it. Answers through moved phones are rerouted and stay
+exactly right.
 
 ## When a phone leaves
 
@@ -196,10 +227,10 @@ ETHGlobal piece.
 |---|---|---|
 | 1 | **Python reference.** Export the weights as blocks, write a NumPy stage engine, and prove that split runs give exactly the same tokens as the unsplit model. | Done: 17/17 checks. Matches Hugging Face, and every split is bit-identical. [reference/](reference/README.md) |
 | 2 | **JS engine in Node.** Port the stage to JavaScript and check it against step 1's test vectors. | Done: 16/16 checks. Matches Python to about 1e-6, 30 ms per token on a laptop with the WASM kernels (130 ms in plain JS). [engine/](engine/README.md) |
-| 3 | **Swarm in browser tabs.** Tracker, routes and sessions, with several tabs on one laptop standing in for phones. The output must match Hugging Face token for token. | Done: 35/35 checks. 40 of 40 tokens through the swarm, and h on the wire is bit-identical to step 2. Speed-aware routing, and conversations that keep their KV caches between questions. [swarm/](swarm/README.md) |
+| 3 | **Swarm in browser tabs.** Tracker, routes and sessions, with several tabs on one laptop standing in for phones. The output must match Hugging Face token for token. | Done: 45/45 checks. 40 of 40 tokens through the swarm, and h on the wire is bit-identical to step 2. Speed-aware routing, and conversations that keep their KV caches between questions. [swarm/](swarm/README.md) |
 | 3.5 | **Mock phones as containers.** Each phone is a Docker container running Chromium, behind HTTPS, with Wi-Fi delay and loss, frozen phones, killed phones and slow phones. | Done: 16/16 scenarios. Wi-Fi adds about 70 ms per token; a frozen phone is dropped after 5 s. [docker/](docker/README.md) |
 | 4 | **Real phones.** HTTPS, screen wake lock, weights cached in the browser, phones that stay reachable while they compute, then faster WASM kernels with int8 weights. | Real phones answered over a Cloudflare tunnel and on the LAN. Wake lock, weight cache and busy-aware heartbeat done: 17/17 container checks. WASM SIMD matmul kernels done: 4× faster per token, 12× faster on the prompt. [engine/](engine/README.md#speed) [swarm/](swarm/README.md#real-phones) |
-| 5 | **Credits, recovery, dashboard.** Credit balances, rerouting when a phone leaves, rebalancing blocks, and a live view of the swarm. | Rerouting, the dashboard (`/dashboard`) and the management view (`/manage`) done. Rebalancing and credits next. |
+| 5 | **Credits, recovery, dashboard.** Credit balances, rerouting when a phone leaves, rebalancing blocks, and a live view of the swarm. | Rerouting, rebalancing (a whole path, then replicas, then splitting the slowest block), the dashboard (`/dashboard`) and the management view (`/manage`) done. Credits next. |
 
 After the MVP:
 

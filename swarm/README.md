@@ -12,12 +12,13 @@ Needs Node 22+ and the outputs of step 1 (`weights/` and `testvectors/`):
 ```sh
 .venv/bin/python reference/tokenizer_vectors.py   # once: tokenizer ids for the checks
 cd swarm && npm install
-npm run check      # 35 checks, under a minute
-npm start          # tracker on http://localhost:8080
+npm run check      # 45 checks, under a minute
+npm start          # tracker on http://localhost:8080; --min-blocks 3 --min-replica 2 by default
 ```
 
 Then open `http://localhost:8080` in three or more tabs. The first three tabs
-get blocks 1, 2 and 3. Ask a question in any tab. The answer to "Explain in
+get blocks 1, 2 and 3; with `npm start -- --min-replica 1`, a fourth tab
+splits block 2. Ask a question in any tab. The answer to "Explain in
 two sentences why the sky is blue." should start with the same text as
 `reference/chat.py`.
 
@@ -48,7 +49,7 @@ Phones need an `https://` page. Two ways that work:
 
 ## What the checks prove
 
-The checks start the real tracker and run six phones in one Node process.
+The checks start the real tracker and run up to nine phones in one Node process.
 The phones fetch weights over HTTP and talk only through the tracker's
 WebSocket, the same path a tab uses.
 
@@ -56,6 +57,7 @@ WebSocket, the same path a tab uses.
 |---|---|
 | Tokenizer gives Hugging Face's ids on 25 tricky strings and 3 chats, and decodes back | yes, including emoji, Hindi, Chinese, code and special tokens |
 | Frames survive encode/decode bit for bit | yes, 2,320 bytes per hop per new token |
+| Where phones go, by the rules alone (`src/blocks.js`) | first cut 0, 8, 23, 30; a path at 3 phones, 2 per block at 6, the 7th on block 2, the 8th splits it into 8–14 and 15–22; with `min-replica` 1 the 4th splits; 6 repair cases |
 | Asking before every block has a holder | clear "waiting for block 2" error |
 | Six phones split two per block | A,D · B,E · C,F |
 | **Greedy answer through the swarm equals Hugging Face's** | 40 of 40 |
@@ -66,11 +68,13 @@ WebSocket, the same path a tab uses.
 | A phone on the conversation's route leaves between questions | the next question replays the conversation (81 tokens) through another phone and is still right |
 | New chat | the session ends and every phone frees its KV cache |
 | **A phone leaving mid-answer** | rerouted to A → E → C; all 30 tokens still equal Hugging Face's |
-| The last holder of a block leaving mid-answer | clear error: "no other phone has block 2 ready" |
+| The last holder of a block leaving mid-answer | a phone from block 1 moves in, loads block 2, and the answer is still right |
 | Sessions end | every phone has freed every KV cache |
 | A phone silent for 12 s while it owes a reply | kept, and its answer is right |
 | The same phone silent while idle | dropped after the 8 s heartbeat timeout |
-| What phones get | a 228-byte summary, only when it changes |
+| **Rebalancing live**, from one phone per block | 3 more fill every block to 2; the 7th joins block 2; the 8th splits it in the middle of a 30-token answer: D,J take 8–14, L and the new M take 15–22, the route grows to four hops, and all 30 tokens still equal Hugging Face's |
+| A block falling below `min-replica` while another has a spare | the spare moves there, and the next answer is right |
+| What phones get | a 312-byte summary for four blocks, only when it changes |
 | What the dashboard gets | every phone's ping and time per token, throughput, a log line per answer, a QR code |
 
 Planted bugs that the checks catch: routing that ignores load, the tracker
@@ -87,6 +91,7 @@ the reference answer through A → B → C.
 | `tracker.js` | HTTP for the pages, code, weights and `/qr.svg`; WebSocket at `/ws` for the swarm and the dashboards |
 | `src/protocol.js` | Binary frame format |
 | `src/peer.js` | One phone: join, load its block, serve frames, ask. Same code in Node and in the browser |
+| `src/blocks.js` | Where phones go: the first cut, joins, splits and repairs, as pure functions |
 | `src/tokenizer.js` | Byte-level BPE and the chat template, no dependencies |
 | `src/arkiv.js` | Saves conversations and metrics to Arkiv (tracker only) |
 | `web/` | The phone: `index.html` and `app.js` for the UI, `worker.js` runs it in a Web Worker and caches its weights |
@@ -94,9 +99,27 @@ the reference answer through A → B → C.
 | `web/arkiv.*` | The database peek, on the phone page and at `/arkiv` |
 | `test/check.js` | The checks |
 
-**Joining.** A tab says hello. The tracker gives it the block with the fewest
-holders, and the tab downloads that block's weights from `/weights/`. When
-loaded, it tells the tracker it is ready. Only ready phones get routed to.
+**Joining.** A tab says hello. The tracker gives it a block, and the tab
+downloads that block's weights from `/weights/`. When loaded, it tells the
+tracker it is ready. Only ready phones get routed to.
+
+**Rebalancing.** At start the tracker cuts the layers into `--min-blocks`
+blocks of balanced memory (0, 8, 23, 30 for 3). A joining phone goes to a
+block nobody holds, else to a block below `--min-replica` phones, else to the
+block with the most compute (the output layer counts as 8 layers). The phone
+that brings that block to 2 × `min-replica` splits it at its compute
+midpoint: its `min-replica` earliest phones take the first half, the rest and
+the new phone the second. A phone that leaves is replaced from inside the
+swarm: a block nobody holds takes a phone from the block with the most, and a
+block below `min-replica` takes one from a block above it. Split blocks stay
+split.
+
+A moved phone gets `assign`, drops its old block and loads the new one, from
+its weight cache when it has those layers, as after a split. Answers through
+it are rerouted under a new attempt and wait until every block has a ready
+phone, then replay. A split reroutes every session, since every route went
+through the old block. Rebalancing reroutes don't count towards the limit of
+5 per answer, and a session waiting more than 60 s for its phones fails.
 
 **Asking.** The asker asks the tracker for a session. For each block the
 tracker picks the ready holder that should deliver tokens soonest: its
@@ -227,7 +250,7 @@ up as a new block height, one more turn and a "just updated" mark.
 
 ## Wire format
 
-Control messages are small JSON: `hello`, `welcome`, `ready`, `ask`,
+Control messages are small JSON: `hello`, `welcome`, `assign`, `ready`, `ask`,
 `session`, `turn`, `reroute`, `end`, `drop`, `fail`, `error`, `stats`, `swarm`,
 `record`/`recorded` for Arkiv, and
 `watch`/`state` for the dashboards.
@@ -254,8 +277,9 @@ slower; each phone's page says which kernels it runs.
 
 ## Not yet
 
-- Rebalancing: moving a phone to a block that has lost its holders. New
-  phones fill the emptiest block, but nothing moves a phone that has joined.
+- Merging split blocks back when phones leave, and moving phones by measured
+  speed rather than layer counts. A split pauses answers for a moment while
+  the split block's phones reload.
 - Attention, RoPE and SiLU in WASM too; credits (step 5).
 - Direct phone-to-phone WebRTC (after the MVP).
 - A cap on KV cache memory per phone. Idle conversations hold theirs until

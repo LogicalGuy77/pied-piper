@@ -28,7 +28,7 @@
     .muted { color: var(--muted); }
     .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 8px; }
     .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
-    .blocks { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .blocks { display: grid; grid-template-columns: repeat(var(--n, 3), 1fr); gap: 8px; }
     .block { border-radius: 10px; padding: 8px; border: 1px solid; min-height: 72px; }
     .block[data-b="0"] { background: var(--b1); border-color: var(--b1s); }
     .block[data-b="1"] { background: var(--b2); border-color: var(--b2s); }

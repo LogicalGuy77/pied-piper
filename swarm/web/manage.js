@@ -43,7 +43,7 @@ function render(state) {
     const utils = r.map((p) => p.utilization).filter((x) => x != null);
     const served = r.map((p) => p.servedPerSec).filter((x) => x != null);
     const parts = b.start === 0 ? ["embedding"] : [];
-    parts.push(`layers ${b.start}–${b.end - 1}`);
+    parts.push(b.end - b.start > 1 ? `layers ${b.start}–${b.end - 1}` : `layer ${b.start}`);
     if (b.end === state.blocks.at(-1).end) parts.push("output");
     return { b, holders, r, label: parts.join(" + "), cap: caps.length ? caps.reduce((x, y) => x + y, 0) : null,
       util: utils.length ? utils.reduce((x, y) => x + y, 0) / utils.length : null,

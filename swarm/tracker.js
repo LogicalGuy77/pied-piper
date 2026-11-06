@@ -1,11 +1,17 @@
 // The laptop's tracker. Serves the phone page, the dashboard and the weights
-// over HTTP and runs the swarm over a WebSocket at /ws: assigns blocks, picks
-// routes, reroutes answers when a phone leaves, and in v1 relays every frame
-// between phones.
+// over HTTP and runs the swarm over a WebSocket at /ws: assigns and rebalances
+// blocks, picks routes, reroutes answers when a phone leaves, and in v1 relays
+// every frame between phones.
 //
-//   node swarm/tracker.js [--port 8080] [--host 0.0.0.0] [--weights DIR] [--blocks 0,8,22,30]
+//   node swarm/tracker.js [--port 8080] [--host 0.0.0.0] [--weights DIR]
+//                         [--min-blocks 3] [--min-replica 2]
 //                         [--tls-cert FILE --tls-key FILE] [--public-url URL]
 //                         [--heartbeat-timeout 5000] [--busy-timeout 20000] [--session-idle 600000]
+//
+// Blocks: the first phones make one whole path of --min-blocks blocks, the
+// next ones give every block --min-replica holders, and after that the
+// largest block splits in two each time it gathers enough phones for both
+// halves (src/blocks.js).
 //
 // With a certificate it serves HTTPS and WSS, which phones on the LAN need:
 // browsers only allow Wake Lock and similar APIs on https:// pages.
@@ -27,6 +33,7 @@ import { parseArgs } from "node:util";
 import qrcode from "qrcode-generator";
 import { WebSocketServer } from "ws";
 import { createArkivStore, describeError } from "./src/arkiv.js";
+import { costModel, initialCut, placeJoin, repairMove, splitPoint } from "./src/blocks.js";
 import { KIND, readHeader } from "./src/protocol.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -41,7 +48,8 @@ const { values: opts } = parseArgs({
     port: { type: "string", default: "8080" },
     host: { type: "string", default: "0.0.0.0" },
     weights: { type: "string", default: join(ROOT, "weights", "smollm2-135m-instruct") },
-    blocks: { type: "string", default: "0,8,22,30" },
+    "min-blocks": { type: "string", default: "3" },
+    "min-replica": { type: "string", default: "2" },
     "tls-cert": { type: "string" },
     "tls-key": { type: "string" },
     "public-url": { type: "string" },
@@ -51,12 +59,16 @@ const { values: opts } = parseArgs({
   },
 });
 
-const boundaries = opts.blocks.split(",").map(Number);
-const blocks = boundaries.slice(0, -1).map((start, index) => ({ index, start, end: boundaries[index + 1] }));
 const HEARTBEAT_TIMEOUT = Number(opts["heartbeat-timeout"]);
 const BUSY_TIMEOUT = Number(opts["busy-timeout"]);
 const SESSION_IDLE = Number(opts["session-idle"]); // a conversation idle this long frees its KV caches
-const MAX_REROUTES = 5; // per session
+const MAX_REROUTES = 5;      // per session, for phones leaving; rebalancing doesn't count
+const ROUTE_WAIT = 60000;    // how long a session may wait for its blocks' phones to load
+const MIN_REPLICA = Number(opts["min-replica"]);
+if (!(MIN_REPLICA >= 1)) {
+  console.error(`--min-replica must be at least 1, got ${opts["min-replica"]}`);
+  process.exit(1);
+}
 
 // Phones cache weights under this version, so re-exported weights replace the cache.
 function versionOf(dir) {
@@ -72,6 +84,20 @@ if (!statSync(join(resolve(opts.weights), "manifest.json"), { throwIfNoEntry: fa
   process.exit(1);
 }
 const weightsVersion = versionOf(resolve(opts.weights));
+
+// The blocks, in layer order: { id, index, start, end }. They change when a
+// block splits; id stays the same for a block's lifetime, index is its place.
+const manifest = JSON.parse(readFileSync(join(resolve(opts.weights), "manifest.json"), "utf8"));
+const cost = costModel(manifest);
+let blocks;
+try {
+  const bounds = initialCut(manifest, Number(opts["min-blocks"]));
+  blocks = bounds.slice(0, -1).map((start, index) => ({ id: index + 1, index, start, end: bounds[index + 1] }));
+} catch (err) {
+  console.error(`--min-blocks: ${err.message}`);
+  process.exit(1);
+}
+let nextBlockId = blocks.length + 1;
 
 let arkiv = null;
 try {
@@ -204,11 +230,63 @@ function log(line) {
 const ewma = (old, x) => (old == null ? x : 0.8 * old + 0.2 * x);
 const secs = (ms) => `${(ms / 1000).toFixed(1)} s`;
 
-// The block with the fewest holders, lowest block first on a tie.
-function assignBlock() {
-  const holders = blocks.map(() => 0);
-  for (const p of peers.values()) holders[p.block.index]++;
-  return blocks[holders.indexOf(Math.min(...holders))];
+const holdersOf = (b) => [...peers.values()].filter((p) => p.block === b);
+const holderCounts = () => blocks.map((b) => holdersOf(b).length);
+const range = (b) => `[${b.start}, ${b.end})`;
+
+// Gives a joining phone its block (src/blocks.js). When it is the phone that
+// splits the largest block, the split happens here and it gets a half.
+function placeNewPhone(peer) {
+  const place = placeJoin(blocks, holderCounts(), { minReplica: MIN_REPLICA, cost });
+  if (place.split === undefined) peer.block = blocks[place.block];
+  else split(blocks[place.split], peer);
+}
+
+// Cuts a block in two at its compute midpoint. Its first minReplica holders,
+// earliest joined first, take the first half and the rest the second, with
+// the joining phone. They already have the weights of both halves, so only
+// the joining phone downloads anything. Every route passes through the old
+// block, so every session gets a new route once the halves have ready
+// holders.
+function split(b, joining) {
+  const m = splitPoint(b, cost);
+  const halves = [{ id: nextBlockId++, start: b.start, end: m }, { id: nextBlockId++, start: m, end: b.end }];
+  const holders = holdersOf(b).sort((x, y) => x.joinedAt - y.joinedAt);
+  blocks.splice(b.index, 1, ...halves);
+  blocks.forEach((x, i) => (x.index = i));
+  holders.forEach((p, i) => setBlock(p, halves[i < MIN_REPLICA ? 0 : 1]));
+  joining.block = halves[1];
+  log(`block ${b.index + 1} ${range(b)} splits into ${range(halves[0])} and ${range(halves[1])}: ` +
+    halves.map((h) => `${[...holdersOf(h), ...(h === joining.block ? [joining] : [])].map((p) => p.id).join(",")} on ${range(h)}`).join(", "));
+  for (const id of [...sessions.keys()]) reroute(id, `block ${b.index + 1} split`);
+  for (const p of holders) send(p, { type: "assign", block: p.block, blocks });
+}
+
+function setBlock(p, block) {
+  p.block = block;
+  p.ready = false;
+}
+
+// Moves a phone to another block. It drops its old block and loads the new
+// one; answers it was serving get new routes.
+function movePeer(p, block, why) {
+  setBlock(p, block);
+  log(`${p.id} moves to block ${block.index + 1} (layers ${block.start}–${block.end - 1}): ${why}`);
+  for (const id of [...p.sessions]) if (sessions.has(id)) reroute(id, `${p.id} moved`);
+  send(p, { type: "assign", block, blocks });
+}
+
+// After a phone leaves: refill a block nobody holds, then blocks below
+// --min-replica, with phones from blocks that can spare one (src/blocks.js).
+// Each move takes the donor block's phone with the fewest answers in
+// progress, the newest on a tie.
+function repair() {
+  for (let move; (move = repairMove(holderCounts(), MIN_REPLICA)); ) {
+    const donor = holdersOf(blocks[move.from]).sort((x, y) => activeSessions(x) - activeSessions(y) || y.joinedAt - x.joinedAt)[0];
+    const to = blocks[move.to];
+    const had = holdersOf(to).length;
+    movePeer(donor, to, had ? `it had ${had} of ${MIN_REPLICA} phones` : "nobody held it");
+  }
 }
 
 // Answers this phone is generating right now; idle conversations don't count.
@@ -222,8 +300,8 @@ function activeSessions(p) {
 // soonest: its measured time per token (compute plus network), shared with
 // the answers it is already generating. A phone not measured yet counts as
 // the median of its block's measured holders. Earliest joined wins a tie.
-function pickHolder(blockIndex) {
-  const holders = [...peers.values()].filter((p) => p.block.index === blockIndex && p.ready);
+function pickHolder(block) {
+  const holders = holdersOf(block).filter((p) => p.ready);
   const measured = holders.map((p) => p.tokenMs).filter((ms) => ms != null).sort((a, b) => a - b);
   const typical = measured.length ? measured[Math.floor(measured.length / 2)] : 1;
   let best = null, bestCost = Infinity;
@@ -278,32 +356,63 @@ function endSession(id, why = null) {
   changed();
 }
 
-// A phone on the route left: swap in another holder of its block. Every phone
-// on the route drops the old attempt, and the asker replays the conversation
-// under the new one, so the answer continues instead of failing.
-function reroute(id, leaver, why) {
+// The session's route no longer works: a phone on it left or moved, or its
+// blocks changed. Every phone on it drops the old attempt, and the session
+// waits for a new route; the asker then replays the conversation under the
+// new attempt, so the answer continues instead of failing. It fails only if
+// some block has no phone at all, not even one loading. `left` counts
+// towards MAX_REROUTES.
+function reroute(id, why, { left = false } = {}) {
   const s = sessions.get(id);
-  const hop = s.route.indexOf(leaver.id);
-  const replacement = pickHolder(leaver.block.index);
-  if (!replacement || s.reroutes >= MAX_REROUTES) {
-    const reason = replacement ? `it was already rerouted ${s.reroutes} times` : `no other phone has block ${leaver.block.index + 1} ready`;
-    send(peers.get(s.asker), { type: "error", session: id, message: `phone ${leaver.id} ${why} in the middle of the answer, and ${reason}` });
-    return endSession(id, `cut: ${leaver.id} ${why}, ${reason}`);
-  }
-  for (const pid of s.route) {
+  const fail = (reason) => {
+    if (s.active || s.request != null) {
+      send(peers.get(s.asker), { type: "error", session: id, requestId: s.request ?? undefined, message: `${why} in the middle of the answer, and ${reason}` });
+    }
+    endSession(id, `cut: ${why}, ${reason}`);
+  };
+  if (left && s.reroutes >= MAX_REROUTES) return fail(`it was already rerouted ${s.reroutes} times`);
+  for (const pid of new Set(s.route)) {
     const p = peers.get(pid);
     if (!p) continue;
+    p.sessions.delete(id);
     p.owed.delete(id);
     send(p, { type: "drop", session: id, attempt: s.attempt });
   }
   s.attempt++;
-  s.reroutes++;
-  s.route[hop] = replacement.id;
+  if (left) s.reroutes++;
+  s.route = [];
+  s.waitingSince = Date.now();
+  const empty = blocks.find((b) => !holdersOf(b).length);
+  if (empty) return fail(`no phone holds block ${empty.index + 1}`);
+  if (!connect(id)) log(`session ${id}: ${why}, waiting for phones to load`);
+}
+
+// Gives a waiting session its route, once every block has a ready holder.
+// A new question gets its session now; an answer in progress or a kept
+// conversation is told to replay under the new attempt.
+function connect(id) {
+  const s = sessions.get(id);
+  const route = blocks.map(pickHolder);
+  if (route.includes(null)) return false;
+  s.route = route.map((p) => p.id);
+  s.waitingSince = 0;
   s.hopMs = s.route.map(() => 0);
   s.hopN = s.route.map(() => 0);
-  replacement.sessions.add(id);
-  send(peers.get(s.asker), { type: "reroute", session: id, attempt: s.attempt, route: s.route });
-  log(`session ${id}: ${leaver.id} ${why}, continuing via ${s.route.join(" → ")} (replaying ${s.context} tokens)`);
+  for (const p of route) p.sessions.add(id);
+  const name = s.turn > 1 ? `session ${id} turn ${s.turn}` : `session ${id}`;
+  if (s.request != null) {
+    send(peers.get(s.asker), { type: "session", requestId: s.request, session: id, route: s.route, attempt: s.attempt });
+    s.request = null;
+    log(`${name}: ${s.asker} asks via ${s.route.join(" → ")}${s.context ? `, replaying ${s.context} tokens` : ""}`);
+  } else {
+    send(peers.get(s.asker), { type: "reroute", session: id, attempt: s.attempt, route: s.route, reroutes: s.reroutes });
+    log(`${name}: continuing via ${s.route.join(" → ")} (replaying ${s.context} tokens)`);
+  }
+  return true;
+}
+
+function connectWaiting() {
+  for (const [id, s] of sessions) if (s.waitingSince) connect(id);
 }
 
 // Phones get a small summary, only when it changes; the dashboard gets
@@ -350,8 +459,9 @@ function fullState() {
     sessionIdle: SESSION_IDLE,
     sessions: [...sessions.entries()].map(([id, s]) => ({
       id, asker: s.asker, route: s.route, attempt: s.attempt, reroutes: s.reroutes, context: s.context, tokens: s.tokens,
-      active: s.active, turn: s.turn,
+      active: s.active, turn: s.turn, waiting: !!s.waitingSince,
     })),
+    minReplica: MIN_REPLICA,
     events,
     arkiv: arkiv ? arkiv.info() : { enabled: false, reason: ARKIV_OFF },
   });
@@ -376,8 +486,10 @@ function changed() {
 
 function onControl(peer, msg) {
   if (msg.type === "ready") {
+    if (msg.block !== undefined && msg.block !== peer.block.id) return; // loaded a block it has since been moved off
     peer.ready = true;
     log(`${peer.id} ready with block ${peer.block.index + 1}`);
+    connectWaiting();
   } else if (msg.type === "ask") {
     const now = Date.now();
     const old = sessions.get(msg.session);
@@ -385,22 +497,24 @@ function onControl(peer, msg) {
       // The next question of a conversation: same route, its KV caches still there.
       old.turn++;
       newTurn(old, now);
+      if (old.waitingSince) {
+        old.request = msg.requestId; // its route is still being rebuilt; answered by connect()
+        return changed();
+      }
       send(peer, { type: "session", requestId: msg.requestId, session: msg.session, route: old.route, attempt: old.attempt });
       log(`session ${msg.session} turn ${old.turn}: ${peer.id} asks again via ${old.route.join(" → ")}, ${old.context} tokens cached`);
       return changed();
     }
-    const route = blocks.map((b) => pickHolder(b.index));
-    const missing = route.indexOf(null);
-    if (missing >= 0) {
-      return send(peer, { type: "error", requestId: msg.requestId, message: `waiting for block ${missing + 1}: no phone has it ready yet` });
+    const empty = blocks.find((b) => !holdersOf(b).length);
+    if (empty) {
+      return send(peer, { type: "error", requestId: msg.requestId, message: `waiting for block ${empty.index + 1}: no phone holds it yet` });
     }
+    // Every block has a phone; if some are still loading, the question waits for them.
     const id = nextSession++;
-    const s = { asker: peer.id, route: route.map((p) => p.id), attempt: 0, reroutes: 0, context: 0, turn: 1, idleSince: 0 };
+    const s = { asker: peer.id, route: [], attempt: 0, reroutes: 0, context: 0, turn: 1, idleSince: 0, request: msg.requestId, waitingSince: now };
     newTurn(s, now);
     sessions.set(id, s);
-    for (const p of route) p.sessions.add(id);
-    send(peer, { type: "session", requestId: msg.requestId, session: id, route: s.route, attempt: 0 });
-    log(`session ${id}: ${peer.id} asks via ${s.route.join(" → ")}`);
+    if (!connect(id)) log(`session ${id}: ${peer.id} asks, waiting for phones to load`);
   } else if (msg.type === "turn") {
     // The asker has its answer and keeps the conversation for its next question.
     const s = sessions.get(msg.session);
@@ -490,7 +604,7 @@ function cleanMessages(messages) {
 function onFrame(peer, data) {
   const h = readHeader(data);
   const s = sessions.get(h.session);
-  if (!s || h.attempt !== s.attempt) return; // session ended or rerouted; a late frame
+  if (!s || h.attempt !== s.attempt || !s.route.length) return; // session ended or rerouted; a late frame
   const expectedFrom = h.hop === 0 ? s.asker : s.route[h.hop - 1];
   const expectedKind = h.hop === 0 ? KIND.TOKENS : h.hop === s.route.length ? KIND.NEXT : KIND.HIDDEN;
   if (peer.id !== expectedFrom || h.kind !== expectedKind || h.hop > s.route.length) {
@@ -534,10 +648,11 @@ function onLeave(peer, why = "left") {
   if (!peers.has(peer.id)) return;
   peers.delete(peer.id);
   log(`${peer.id} ${why} (block ${peer.block.index + 1})`);
-  for (const [id, s] of [...sessions]) {
-    if (s.asker === peer.id) endSession(id, `ended: asker ${peer.id} ${why}`);
-    else if (s.route.includes(peer.id)) reroute(id, peer, why);
-  }
+  for (const [id, s] of [...sessions]) if (s.asker === peer.id) endSession(id, `ended: asker ${peer.id} ${why}`);
+  // Refill its block first, so the answers it was serving can wait for the
+  // phone moving in instead of failing.
+  repair();
+  for (const [id, s] of [...sessions]) if (s.route.includes(peer.id)) reroute(id, `phone ${peer.id} ${why}`, { left: true });
   changed();
 }
 
@@ -558,6 +673,12 @@ setInterval(() => {
   for (const peer of peers.values()) sample(peer.samples, { t: now, served: peer.served, computeMs: peer.report?.computeMs ?? null });
   for (const [id, s] of [...sessions]) {
     if (!s.active && now - s.idleSince > SESSION_IDLE) endSession(id, `expired after ${secs(now - s.idleSince)} idle`);
+    else if (s.waitingSince && now - s.waitingSince > ROUTE_WAIT) {
+      if (s.active || s.request != null) {
+        send(peers.get(s.asker), { type: "error", session: id, requestId: s.request ?? undefined, message: `no route: the swarm's phones took more than ${secs(ROUTE_WAIT)} to load` });
+      }
+      endSession(id, `no route after ${secs(ROUTE_WAIT)}`);
+    }
   }
   for (const peer of [...peers.values()]) {
     const limit = peer.owed.size ? BUSY_TIMEOUT : HEARTBEAT_TIMEOUT;
@@ -589,12 +710,13 @@ wss.on("connection", (ws) => {
     if (isBinary) return peer && onFrame(peer, data);
     const msg = JSON.parse(data.toString());
     if (msg.type === "hello" && !peer) {
-      const block = assignBlock();
       peer = {
-        id: peerName(joined++), ws, block, ready: false, sessions: new Set(), served: 0, lastSeen: Date.now(), joinedAt: Date.now(),
+        id: peerName(joined++), ws, block: null, ready: false, sessions: new Set(), served: 0, lastSeen: Date.now(), joinedAt: Date.now(),
         owed: new Map(), rtt: null, pingAt: null, tokenMs: null, prefillMsPerToken: null, report: null, summary: null, samples: [],
       };
+      placeNewPhone(peer);
       peers.set(peer.id, peer);
+      const { block } = peer;
       send(peer, { type: "welcome", id: peer.id, block, blocks, weightsVersion });
       log(`${peer.id} joined, holds block ${block.index + 1} (layers ${block.start}–${block.end - 1})`);
     } else if (msg.type === "watch" && !peer) {
@@ -623,6 +745,6 @@ server.listen(Number(opts.port), opts.host, () => {
   if (opts["public-url"]) console.log(`  for phones: ${opts["public-url"]}`);
   console.log(`  dashboard: ${scheme}://localhost:${port}/dashboard`);
   console.log(`  management: ${scheme}://localhost:${port}/manage`);
-  console.log(`  blocks: ${blocks.map((b) => `[${b.start}, ${b.end})`).join(" ")}`);
+  console.log(`  blocks: ${blocks.map(range).join(" ")}, at least ${MIN_REPLICA} phone${MIN_REPLICA > 1 ? "s" : ""} each before splitting`);
   console.log(arkiv ? `  arkiv: saving conversations as ${arkiv.address} on Rabdi, see ${scheme}://localhost:${port}/arkiv` : `  ${ARKIV_OFF}`);
 });

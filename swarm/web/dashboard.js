@@ -56,11 +56,12 @@ function render() {
   $("nPhones").textContent = state.peers.length;
   $("nSessions").textContent = state.sessions.filter((s) => s.active).length;
   $("nServed").textContent = state.peers.reduce((sum, p) => sum + p.served, 0);
+  $("blocks").style.setProperty("--n", Math.min(state.blocks.length, 5));
   $("blocks").innerHTML = state.blocks.map((b) => {
     const holders = state.peers.filter((p) => p.block === b.index);
     const ready = holders.filter((p) => p.ready).length;
     const parts = b.start === 0 ? ["embedding"] : [];
-    parts.push(`layers ${b.start}–${b.end - 1}`);
+    parts.push(b.end - b.start > 1 ? `layers ${b.start}–${b.end - 1}` : `layer ${b.start}`);
     if (b.end === state.blocks.at(-1).end) parts.push("output");
     const warn = ready === 0 ? "no phone ready: questions wait" : ready === 1 ? "only one phone: no backup" : "";
     return `<div class="block" data-b="${b.index % 3}">
@@ -70,7 +71,8 @@ function render() {
       ${holders.map(phoneCard).join("")}</div>`;
   }).join("");
   $("sessions").textContent = state.sessions.length
-    ? state.sessions.map((s) => `#${s.id}  ${s.asker} ${s.active ? "asks" : "idle"} via ${s.route.join(" → ")} · ` +
+    ? state.sessions.map((s) => `#${s.id}  ${s.asker} ${s.active ? "asks" : "idle"} ` +
+      `${s.waiting ? "waiting for phones to load" : `via ${s.route.join(" → ")}`} · ` +
       (s.active ? `${s.tokens} tokens` : `${s.context} tokens cached`) +
       `${s.turn > 1 ? ` · turn ${s.turn}` : ""}${s.reroutes ? ` · rerouted ${s.reroutes}×` : ""}`).join("\n")
     : "None right now.";

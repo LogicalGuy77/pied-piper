@@ -24,7 +24,7 @@ import { Tokenizer } from "./tokenizer.js";
 
 export class Peer {
   // readFile(name) -> bytes of one file under the tracker's /weights/.
-  // onEvent(event) gets { type: "swarm" | "progress" | "served" | "reroute" | "recorded" | "closed", ... }.
+  // onEvent(event) gets { type: "swarm" | "progress" | "loaded" | "assign" | "served" | "reroute" | "recorded" | "fatal" | "closed", ... }.
   // tap(frame) sees every binary frame this phone sends (tests).
   constructor({ server, readFile = null, onEvent = () => {}, tap = null }) {
     this.server = server.replace(/\/$/, "");
@@ -44,6 +44,8 @@ export class Peer {
     this.requests = new Map(); // request id -> { resolve, reject }
     this.asking = new Map();   // session -> state of a question this phone asked
     this.chat = null;          // the kept conversation, between its turns
+    this.loads = 0;            // block loads started; only the latest one counts
+    this.loading = null;
     this.nextRequest = 1;
     this.queue = [];           // frames waiting to be served, oldest first
     this.working = false;
@@ -75,9 +77,19 @@ export class Peer {
     });
   }
 
-  async load() {
+  // Loads this phone's block and tells the tracker it is ready. If the tracker
+  // moves the phone meanwhile, the load in progress is dropped and this
+  // resolves with the new block's stage.
+  load() {
+    const generation = ++this.loads;
+    this.loading = this.loadBlock(generation);
+    return this.loading;
+  }
+
+  async loadBlock(generation) {
+    const block = this.block;
     const manifest = JSON.parse(new TextDecoder().decode(await this.readFile("manifest.json")));
-    const { start, end } = this.block;
+    const { start, end } = block;
     const L = manifest.config.num_layers;
     const files = manifest.layers.slice(start, end);
     if (start === 0 || end === L) files.push(manifest.embed);
@@ -90,9 +102,22 @@ export class Peer {
       this.onEvent({ type: "progress", loaded, total });
       return bytes;
     };
-    this.stage = await Stage.load({ manifest, start, end, readFile });
-    this.send({ type: "ready" });
-    return this.stage;
+    const stage = await Stage.load({ manifest, start, end, readFile });
+    if (generation !== this.loads) return this.loading;
+    this.stage = stage;
+    this.send({ type: "ready", block: block.id });
+    this.onEvent({ type: "loaded", describe: stage.describe(), weightBytes: stage.weightBytes, kernels: stage.kernels });
+    return stage;
+  }
+
+  // The tracker moved this phone to another block (a split, or a block that
+  // lost its phones). The old block's sessions have all been rerouted, so
+  // drop it before loading the new one: never both in memory at once.
+  reassign(block) {
+    this.block = block;
+    this.stage = null;
+    this.onEvent({ type: "assign", block });
+    this.load().catch((err) => this.onEvent({ type: "fatal", message: err.message }));
   }
 
   async loadTokenizer() {
@@ -130,6 +155,7 @@ export class Peer {
     const { session, route, attempt } = reply;
     let q;
     if (cached && session === cached.session) {
+      if (attempt !== cached.attempt) cached.fed = 0; // rerouted while idle: the new route has seen nothing
       q = Object.assign(cached, { route, attempt, history: ids });
     } else {
       if (cached) this.asking.delete(cached.session); // the tracker had ended it: start over
@@ -265,12 +291,14 @@ export class Peer {
       if (!q) return;
       q.attempt = msg.attempt;
       q.route = msg.route;
-      q.reroutes++;
+      q.reroutes = msg.reroutes ?? q.reroutes + 1;
       q.fed = 0;
       this.onEvent({ type: "reroute", session: msg.session, route: msg.route });
       if (q.waiting) this.feed(msg.session, q);
     } else if (msg.type === "drop") {
       this.drop(msg.session, msg.attempt);
+    } else if (msg.type === "assign") {
+      this.reassign(msg.block);
     } else if (msg.type === "swarm" || msg.type === "recorded") {
       this.onEvent(msg);
     }
@@ -316,16 +344,17 @@ export class Peer {
 
   async serve(f) {
     const key = `${f.session}.${f.attempt}`;
+    const stage = this.stage; // the tracker may move this phone to another block while it computes
     try {
-      if (!this.stage) throw new Error("block is still loading");
-      if ((f.kind === KIND.TOKENS) !== this.stage.hasEmbedding) {
+      if (!stage) throw new Error("block is still loading");
+      if ((f.kind === KIND.TOKENS) !== stage.hasEmbedding) {
         throw new Error(`block ${this.block.index + 1} got the wrong kind of frame`);
       }
       const t0 = performance.now();
-      const out = await this.stage.forwardAsync(key, f.payload, f.pos, { lastOnly: true }, this.pause);
+      const out = await stage.forwardAsync(key, f.payload, f.pos, { lastOnly: true }, this.pause);
       const ms = performance.now() - t0;
       // Dropped while computing: the stage re-recorded the session at the end; forget it again.
-      if (this.isDropped(f)) return this.stage.drop(key);
+      if (this.isDropped(f)) return stage.drop(key);
       this.served += f.n;
       this.computeMs += ms;
       if (f.n === 1) {
@@ -333,7 +362,7 @@ export class Peer {
         this.decoded++;
       }
       const next = { hop: f.hop + 1, attempt: f.attempt, session: f.session };
-      if (this.stage.hasOutput) {
+      if (stage.hasOutput) {
         this.sendFrame({ ...next, kind: KIND.NEXT, pos: f.pos + f.n, n: 1 }, Int32Array.of(argmax(out)));
       } else {
         this.sendFrame({ ...next, kind: KIND.HIDDEN, pos: f.pos, n: f.n }, out);

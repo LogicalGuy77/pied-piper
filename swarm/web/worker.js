@@ -51,16 +51,22 @@ async function fetchBytes(url) {
   return res.arrayBuffer();
 }
 
+// The tracker can move this phone to another block at any time; the page
+// hears "assign", then progress, then "loaded" again.
+function onEvent(e) {
+  if (e.type === "assign") fromCache = 0;
+  post(e.type === "loaded" ? { ...e, fromCache } : e);
+}
+
 async function start(server) {
-  peer = new Peer({ server, readFile, onEvent: post });
+  peer = new Peer({ server, readFile, onEvent });
   try {
     const welcome = await peer.connect();
     cache = await openCache(peer.weightsVersion);
     post({ type: "welcome", id: peer.id, block: peer.block, blocks: welcome.blocks, cached: !!cache });
     await peer.loadTokenizer();
     post({ type: "tokenizer" });
-    await peer.load();
-    post({ type: "loaded", describe: peer.stage.describe(), weightBytes: peer.stage.weightBytes, fromCache, kernels: peer.stage.kernels });
+    await (peer.loading ?? peer.load()); // already loading if the tracker moved it meanwhile
   } catch (err) {
     post({ type: "fatal", message: err.message });
   }

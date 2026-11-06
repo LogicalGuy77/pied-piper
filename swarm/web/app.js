@@ -19,7 +19,7 @@ let arkivPanel = null;    // the database peek, once opened
 const mb = (bytes) => `${(bytes / 1e6).toFixed(1)} MB`;
 const blockLabel = (b) => {
   const parts = b.start === 0 ? ["embedding"] : [];
-  parts.push(`layers ${b.start}–${b.end - 1}`);
+  parts.push(b.end - b.start > 1 ? `layers ${b.start}–${b.end - 1}` : `layer ${b.start}`);
   if (b.end === blocks.at(-1)?.end) parts.push("output");
   return parts.join(" + ");
 };
@@ -42,6 +42,10 @@ function addMessage(role, text) {
 
 function renderSwarm() {
   if (!swarm) return;
+  blocks = swarm.blocks;
+  const mine = blocks.find((b) => b.id === myBlock);
+  if (mine) $("title").textContent = `Phone ${me} · Block ${mine.index + 1}`; // indices shift when an earlier block splits
+  $("blocks").style.setProperty("--n", Math.min(blocks.length, 4));
   $("blocks").replaceChildren(...swarm.blocks.map((b) => {
     const { ready, loading } = swarm.holders[b.index];
     const el = document.createElement("div");
@@ -49,7 +53,7 @@ function renderSwarm() {
     el.dataset.b = b.index % 3;
     const count = `${ready} ready${loading ? ` · ${loading} loading` : ""}`;
     const warn = ready === 0 ? "no phone yet" : ready === 1 ? "only one phone" : "";
-    el.innerHTML = `<div class="name">Block ${b.index + 1}${b.index === myBlock ? " · you" : ""}</div>`
+    el.innerHTML = `<div class="name">Block ${b.index + 1}${b.id === myBlock ? " · you" : ""}</div>`
       + `<div class="muted" style="font-size:12px">${blockLabel(b)}</div>`
       + `<div class="count">${count}</div>${warn ? `<div class="warn">${warn}</div>` : ""}`;
     return el;
@@ -62,10 +66,17 @@ function renderSwarm() {
 worker.onmessage = ({ data: e }) => {
   if (e.type === "welcome") {
     me = e.id;
-    myBlock = e.block.index;
+    myBlock = e.block.id;
     blocks = e.blocks;
     $("title").textContent = `Phone ${e.id} · Block ${e.block.index + 1}`;
     $("status").textContent = `Holds ${blockLabel(e.block)}. Loading its weights…`;
+    renderSwarm();
+  } else if (e.type === "assign") {
+    // The swarm rebalanced: a block split, or one lost its phones.
+    myBlock = e.block.id;
+    $("title").textContent = `Phone ${me} · Block ${e.block.index + 1}`;
+    $("status").textContent = `The swarm moved this phone to ${blockLabel(e.block)}. Loading…`;
+    $("progress").style.width = "0%";
     renderSwarm();
   } else if (e.type === "tokenizer") {
     tokenizerReady = true;
