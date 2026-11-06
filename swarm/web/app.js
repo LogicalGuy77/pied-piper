@@ -44,23 +44,23 @@ function renderSwarm() {
   if (!swarm) return;
   blocks = swarm.blocks;
   const mine = blocks.find((b) => b.id === myBlock);
-  if (mine) $("title").textContent = `Phone ${me} · Block ${mine.index + 1}`; // indices shift when an earlier block splits
+  if (mine) $("title").innerHTML = `Phone ${me} · <em>Block ${mine.index + 1}</em>`; // indices shift when an earlier block splits
   $("blocks").style.setProperty("--n", Math.min(blocks.length, 4));
   $("blocks").replaceChildren(...swarm.blocks.map((b) => {
     const { ready, loading } = swarm.holders[b.index];
     const el = document.createElement("div");
-    el.className = "block";
-    el.dataset.b = b.index % 3;
+    el.className = b.id === myBlock ? "block mine" : "block";
     const count = `${ready} ready${loading ? ` · ${loading} loading` : ""}`;
     const warn = ready === 0 ? "no phone yet" : ready === 1 ? "only one phone" : "";
-    el.innerHTML = `<div class="name">Block ${b.index + 1}${b.id === myBlock ? " · you" : ""}</div>`
-      + `<div class="muted" style="font-size:12px">${blockLabel(b)}</div>`
+    el.innerHTML = `<div class="name"><i style="background:var(--k${b.index % 6})"></i>Block ${b.index + 1}`
+      + `${b.id === myBlock ? '<span class="you">YOU</span>' : ""}</div>`
+      + `<div class="holds">${blockLabel(b)}</div>`
       + `<div class="count">${count}</div>${warn ? `<div class="warn">${warn}</div>` : ""}`;
     return el;
   }));
   $("routes").textContent = myRoute
     ? `${me} asks via ${myRoute.join(" → ")}`
-    : `${swarm.phones} phones · ${swarm.sessions} question${swarm.sessions === 1 ? "" : "s"} in flight`;
+    : `${swarm.phones} phone${swarm.phones === 1 ? "" : "s"} · ${swarm.sessions} question${swarm.sessions === 1 ? "" : "s"} in flight`;
 }
 
 worker.onmessage = ({ data: e }) => {
@@ -68,14 +68,14 @@ worker.onmessage = ({ data: e }) => {
     me = e.id;
     myBlock = e.block.id;
     blocks = e.blocks;
-    $("title").textContent = `Phone ${e.id} · Block ${e.block.index + 1}`;
+    $("title").innerHTML = `Phone ${e.id} · <em>Block ${e.block.index + 1}</em>`;
     $("status").textContent = `Holds ${blockLabel(e.block)}. Loading its weights…`;
     renderSwarm();
     startWallet(e.walletChallenge);
   } else if (e.type === "assign") {
     // The swarm rebalanced: a block split, or one lost its phones.
     myBlock = e.block.id;
-    $("title").textContent = `Phone ${me} · Block ${e.block.index + 1}`;
+    $("title").innerHTML = `Phone ${me} · <em>Block ${e.block.index + 1}</em>`;
     $("status").textContent = `The swarm moved this phone to ${blockLabel(e.block)}. Loading…`;
     $("progress").style.width = "0%";
     renderSwarm();
@@ -88,6 +88,7 @@ worker.onmessage = ({ data: e }) => {
   } else if (e.type === "loaded") {
     const cached = e.fromCache >= e.weightBytes ? ", from this phone's cache" : "";
     const kernels = e.kernels === "wasm" ? "WASM SIMD" : "plain JS";
+    $("progress").style.width = "100%";
     $("status").textContent = `Serving ${e.describe} (${mb(e.weightBytes)}${cached}, ${kernels}). You can ask too.`;
   } else if (e.type === "swarm") {
     swarm = e;
@@ -128,7 +129,7 @@ worker.onmessage = ({ data: e }) => {
     finishAsk();
   } else if (e.type === "fatal" || e.type === "closed") {
     $("status").textContent = e.message ?? e.reason;
-    $("status").style.color = "var(--bad)";
+    $("status").style.color = "var(--red)";
   }
 };
 
@@ -300,6 +301,12 @@ function report() {
   });
 }
 setInterval(report, 2000);
+
+// The model's name for the chip at the top, from the same manifest the worker loads.
+fetch("/weights/manifest.json").then((r) => r.json()).then((m) => {
+  $("model").textContent = m.source.split("/").at(-1) + (m.dtype && m.dtype !== "float32" ? ` · ${m.dtype}` : "");
+  $("model").hidden = false;
+}).catch(() => {});
 
 keepAwake();
 worker.postMessage({ type: "start", server: location.origin });

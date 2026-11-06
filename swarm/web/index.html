@@ -2,79 +2,102 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Phone Swarm</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="theme.css">
   <style>
-    :root {
-      --bg: #f6f7f9; --card: #ffffff; --text: #16212b; --muted: #5d6b78; --line: #dde2e7;
-      --b1: #d6eef0; --b1s: #0b7a85; --b2: #e3e0f7; --b2s: #5847c2; --b3: #f5e1d3; --b3s: #b4541a;
-      --accent: #0b7a85; --bad: #c2352e;
-      color-scheme: light;
-    }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg: #11161b; --card: #1a2128; --text: #e6ebf0; --muted: #94a2af; --line: #2c3640;
-        --b1: #15393d; --b1s: #4fc3cd; --b2: #2a2550; --b2s: #9d90f0; --b3: #452a1a; --b3s: #f0995e;
-        --accent: #4fc3cd; --bad: #ff7b72;
-        color-scheme: dark;
-      }
-    }
-    * { box-sizing: border-box; }
-    body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, sans-serif; }
-    main { max-width: 760px; margin: 0 auto; padding: 16px; display: grid; gap: 14px; }
-    .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
-    h1 { font-size: 18px; margin: 0 0 4px; }
-    h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 10px; }
-    .muted { color: var(--muted); }
-    .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 8px; }
-    .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
-    .blocks { display: grid; grid-template-columns: repeat(var(--n, 3), 1fr); gap: 8px; }
-    .block { border-radius: 10px; padding: 8px; border: 1px solid; min-height: 72px; }
-    .block[data-b="0"] { background: var(--b1); border-color: var(--b1s); }
-    .block[data-b="1"] { background: var(--b2); border-color: var(--b2s); }
-    .block[data-b="2"] { background: var(--b3); border-color: var(--b3s); }
-    .block .name { font-size: 12px; font-weight: 600; }
-    .block .count { font: 12px ui-monospace, monospace; margin-top: 6px; }
-    .block .warn { font-size: 12px; color: var(--bad); }
-    .note { font-size: 12px; color: var(--muted); margin-top: 8px; }
+    /* One phone's page: what it holds, the swarm at a glance, and a chat. */
+    body { background: var(--canvas); }
+    main { max-width: 720px; margin: 0 auto; display: grid; gap: 14px;
+           padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) 24px max(16px, env(safe-area-inset-left)); }
+    .card { background: var(--surface); border: 1px solid var(--line); border-radius: 18px; padding: 16px 18px; }
+    .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; padding: 4px 2px 0; }
+    .brand .model { margin-left: auto; font-size: 12px; font-weight: 600; color: var(--purple-ink); background: var(--surface); border: 1px solid var(--purple-line);
+                    border-radius: 999px; padding: 4px 10px; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .me { background: var(--hero); border-color: #ece6f3; padding: 20px; }
+    .me .eyebrow { font-size: 12px; color: var(--muted); }
+    .me h1 { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; margin: 4px 0 4px; line-height: 1.2; }
+    .me h1 em { font-style: normal; color: var(--purple); }
+    #status { font-size: 13.5px; color: var(--ink-2); }
+    .bar { height: 8px; background: rgba(255, 255, 255, .8); border-radius: 999px; overflow: hidden; margin-top: 14px; }
+    .bar > div { height: 100%; width: 0; background: linear-gradient(90deg, #a48bf7, var(--purple)); border-radius: 999px; transition: width .2s; }
+    .note { font-size: 12px; color: var(--muted); margin-top: 10px; }
     .note:empty { display: none; }
-    #routes { margin-top: 10px; font: 12px ui-monospace, monospace; color: var(--muted); }
-    #chat { display: grid; gap: 8px; max-height: 50vh; overflow-y: auto; }
-    .msg { padding: 8px 12px; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
-    .msg.user { background: var(--b1); justify-self: end; max-width: 85%; }
-    .msg.assistant { background: var(--bg); border: 1px solid var(--line); max-width: 95%; }
-    .msg.error { color: var(--bad); }
-    .stats { font-size: 12px; color: var(--muted); margin-top: 2px; }
-    form { display: flex; gap: 8px; margin-top: 10px; }
-    textarea { flex: 1; resize: none; font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
-    button { font: inherit; padding: 8px 16px; border-radius: 8px; border: 0; background: var(--accent); color: var(--card); font-weight: 600; cursor: pointer; }
-    button:disabled { opacity: .5; cursor: default; }
-    button.quiet { background: none; color: var(--accent); border: 1px solid var(--line); padding: 2px 10px; font-size: 13px; }
-    .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-    .stats.bad { color: var(--bad); }
-    a { color: var(--accent); }
-    button.linkish { background: none; border: 0; padding: 0; color: var(--accent); font-size: inherit; font-weight: inherit; text-decoration: underline; }
-    .wallet-balance { font-size: 15px; }
-    .wallet-amount { font: 600 24px ui-monospace, monospace; }
-    .note.bad { color: var(--bad); }
-    .wallet-key { display: block; margin-top: 6px; font-size: 11px; overflow-wrap: anywhere; user-select: all; }
-    .wallet-withdraw { flex-wrap: wrap; }
-    .wallet-withdraw input { flex: 1 1 140px; min-width: 0; font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+    h2 { font-size: 15px; font-weight: 600; margin: 0 0 12px; }
+    .blocks { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+    .block { border-radius: 14px; padding: 10px 12px; border: 1px solid var(--line); background: var(--page); min-width: 0; }
+    .block.mine { border-color: var(--purple-line); background: var(--purple-wash); box-shadow: 0 0 0 3px var(--purple-soft); }
+    .block .name { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 7px; }
+    .block .name i { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+    .block .name .you { margin-left: auto; font-size: 10.5px; font-weight: 700; color: var(--purple-ink); background: var(--purple-soft); border-radius: 999px; padding: 1px 7px; }
+    .block .holds { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+    .block .count { font-size: 12px; margin-top: 6px; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+    .block .warn { font-size: 11.5px; color: var(--red); }
+    #routes { margin-top: 12px; font-size: 12.5px; color: var(--muted); }
+    .chat-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    .chat-head h2 { margin: 0; }
+    #chat { display: grid; gap: 10px; max-height: 52vh; overflow-y: auto; }
+    #chat:empty::before { content: "Ask anything. Your question travels through one phone per block, maybe this one."; color: var(--soft); font-size: 13px; }
+    .msg { padding: 10px 14px; border-radius: 16px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14.5px; line-height: 1.5; }
+    .msg.user { background: var(--purple); color: #fff; justify-self: end; max-width: 85%; border-bottom-right-radius: 6px; }
+    .msg.assistant { background: var(--page); border: 1px solid var(--line); max-width: 95%; border-bottom-left-radius: 6px; }
+    .msg.error { color: var(--red); }
+    .stats { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
+    form { display: flex; align-items: flex-end; gap: 8px; margin-top: 12px; background: var(--page); border: 1px solid var(--line); border-radius: 22px; padding: 6px 6px 6px 14px; }
+    form:focus-within { border-color: var(--purple-line); box-shadow: 0 0 0 3px var(--purple-soft); }
+    textarea { flex: 1; min-width: 0; resize: none; font: inherit; font-size: 15px; padding: 7px 0; border: 0; outline: 0; background: none; color: var(--ink); }
+    #send { width: 38px; height: 38px; border-radius: 50%; border: 0; background: var(--purple); color: #fff; display: grid; place-items: center; cursor: pointer; flex: none; }
+    #send:disabled { background: #cfc6ef; cursor: default; }
+    button.quiet { font: 600 12.5px var(--sans); background: none; color: var(--purple-ink); border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px; cursor: pointer; }
+    button.quiet:disabled { opacity: .5; cursor: default; }
+    .chat-head .actions { display: flex; gap: 6px; }
+    .stats.bad, .note.bad { color: var(--red); }
+    .stats a { color: var(--purple-ink); }
+    button.linkish { background: none; border: 0; padding: 0; color: var(--purple-ink); font: inherit; text-decoration: underline; cursor: pointer; }
+    /* Earnings: the wallet card is rendered by swarm/wallet/ (dist/wallet.js). */
+    .earn h2 { display: flex; align-items: center; gap: 8px; }
+    .earn h2 .tag { font-size: 10.5px; font-weight: 700; color: var(--green); background: var(--green-soft); border-radius: 999px; padding: 2px 8px; }
+    #wallet.muted { color: var(--muted); font-size: 13px; }
+    .wallet-balance { font-size: 13px; color: var(--ink-2); }
+    .wallet-amount { display: block; font-size: 28px; font-weight: 600; letter-spacing: -0.02em; color: var(--ink); font-variant-numeric: tabular-nums; }
+    .wallet-key { display: block; margin-top: 8px; font: 11px var(--mono); color: var(--muted); overflow-wrap: anywhere; user-select: all;
+                  background: var(--sunk); border-radius: 8px; padding: 6px 8px; }
+    .wallet-withdraw { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .wallet-withdraw input { flex: 1 1 140px; min-width: 0; font: inherit; font-size: 14px; padding: 9px 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--page); color: var(--ink); }
+    .wallet-withdraw input:focus { outline: 0; border-color: var(--purple-line); box-shadow: 0 0 0 3px var(--purple-soft); }
+    .wallet-withdraw button { font: 600 13.5px var(--sans); padding: 9px 16px; border-radius: 12px; border: 0; background: var(--purple); color: #fff; cursor: pointer; }
+    .wallet-withdraw button:disabled { opacity: .5; cursor: default; }
     .wallet-withdraw .note { flex-basis: 100%; margin-top: 0; }
-    @media (max-width: 480px) { .blocks { grid-template-columns: 1fr; } }
+    #wallet button:not(.linkish) { font: 600 13px var(--sans); padding: 8px 14px; border-radius: 12px; border: 0; background: var(--purple); color: #fff; cursor: pointer; }
+    #wallet button:disabled { opacity: .5; cursor: default; }
+    .arkiv-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+    .arkiv-head h2 { margin: 0; }
+    .arkiv-head a { font-size: 12.5px; font-weight: 600; }
   </style>
 </head>
 <body>
 <main>
-  <section class="card">
-    <h1 id="title">Joining the swarm…</h1>
-    <div id="status" class="muted">Connecting to the tracker</div>
+  <div class="brand">
+    <svg width="24" height="24" viewBox="0 0 28 28" aria-hidden="true">
+      <circle cx="14" cy="7" r="5.5" fill="#7b5cf0"/><circle cx="7.5" cy="19" r="5.5" fill="#a48bf7"/><circle cx="20.5" cy="19" r="5.5" fill="#5a3ad6"/><circle cx="14" cy="15" r="3" fill="#fff"/>
+    </svg>
+    Phone Swarm
+    <span class="model" id="model" hidden></span>
+  </div>
+
+  <section class="card me">
+    <div class="eyebrow">This phone</div>
+    <h1 id="title">Joining the <em>swarm</em>…</h1>
+    <div id="status">Connecting to the tracker</div>
     <div class="bar"><div id="progress"></div></div>
     <div id="awake" class="note"></div>
   </section>
 
-  <section class="card">
-    <h2>Earnings</h2>
+  <section class="card earn">
+    <h2>Earnings <span class="tag">PIPER</span></h2>
     <div id="wallet" class="muted">Setting up this phone's wallet…</div>
   </section>
 
@@ -86,16 +109,18 @@
   </section>
 
   <section class="card">
-    <div class="head"><h2>Ask the swarm</h2><span><button id="peek" class="quiet">Peek at the database</button> <button id="new" class="quiet" disabled>New chat</button></span></div>
+    <div class="chat-head"><h2>Ask the swarm</h2><span class="actions"><button id="peek" class="quiet">Peek at the database</button><button id="new" class="quiet" disabled>New chat</button></span></div>
     <div id="chat"></div>
     <form id="form">
-      <textarea id="input" rows="2" placeholder="Ask a question" disabled></textarea>
-      <button id="send" disabled>Send</button>
+      <textarea id="input" rows="1" placeholder="Ask a question" disabled aria-label="Your question"></textarea>
+      <button id="send" disabled aria-label="Send">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </button>
     </form>
   </section>
 
   <section class="card" id="arkiv" hidden>
-    <div class="head"><h2>Open database · Arkiv</h2><a href="/arkiv" target="_blank" style="font-size:13px">full page</a></div>
+    <div class="arkiv-head"><h2>Open database · Arkiv</h2><a href="/arkiv" target="_blank">Full page</a></div>
     <div id="arkiv-body"></div>
   </section>
 </main>
