@@ -85,7 +85,7 @@ function usePoolPrice() {
   useEffect(() => {
     const read = () => fetch("/market/status").then((r) => r.json()).then((s) => s.price != null && setPrice(s.price)).catch(() => {});
     read();
-    const timer = setInterval(read, 30000);
+    const timer = setInterval(read, 15000);
     return () => clearInterval(timer);
   }, []);
   return price;
@@ -104,6 +104,7 @@ function Trade({ ctx, address, piperBalance, usdcBalance, sign }) {
   const [result, setResult] = useState(null);
   const [inToken, outToken] = side === "buy" ? [usdcToken, piperToken] : [piperToken, usdcToken];
   const have = side === "buy" ? usdcBalance : piperBalance;
+  const poolPrice = usePoolPrice();
 
   let amountIn = null;
   try {
@@ -115,7 +116,7 @@ function Trade({ ctx, address, piperBalance, usdcBalance, sign }) {
     if (!amountIn || amountIn <= 0n) return;
     const timer = setTimeout(() => {
       store.request(send, { type: "quote", side, amountIn: String(amountIn) })
-        .then((r) => setQuote(r.error ? { error: r.error } : { out: BigInt(r.amountOut), for: amountIn }));
+        .then((r) => setQuote(r.error ? { error: r.error } : { ...r, out: BigInt(r.amountOut), for: amountIn }));
     }, 300);
     return () => clearTimeout(timer);
   }, [side, String(amountIn)]);
@@ -162,7 +163,23 @@ function Trade({ ctx, address, piperBalance, usdcBalance, sign }) {
       <input placeholder={`${inToken.symbol} to ${side === "buy" ? "spend" : "sell"}`} value={value} onChange={(e) => setValue(e.target.value)} inputMode="decimal" />
       <button disabled={busy || !quote?.out}>{busy ? "Swapping…" : side === "buy" ? "Buy" : "Sell"}</button>
       <div className="note">
-        {quote?.out != null && <>You get about {trim(formatUnits(quote.out, outToken.decimals))} {outToken.symbol}, after the pool's 0.3% and the 0.2% that pays the swarm's gas. </>}
+        {poolPrice != null && <>Pool price: 1 PIPER = {poolPrice.toPrecision(4)} USDC (1 USDC ≈ {trim((1 / poolPrice).toFixed(2))} PIPER). </>}
+        You have {trim(formatUnits(have, inToken.decimals))} {inToken.symbol}
+        {have > 0n && <> · <button type="button" className="linkish" onClick={() => setValue(formatUnits(have, inToken.decimals))}>use all</button></>}
+        {" · "}<a href="pool.html" target="_blank" rel="noopener">pool details</a>
+      </div>
+      {amountIn > 0n && !quote && <div className="note">Asking the pool…</div>}
+      {quote?.out != null && (
+        <div className="note">
+          <b>You get {trim(formatUnits(quote.out, outToken.decimals))} {outToken.symbol}</b>
+          {quote.rate != null && <>, at {quote.rate.toPrecision(4)} USDC per PIPER: {(100 * quote.cost).toFixed(2)}% {side === "buy" ? "above" : "below"} the pool price, fees included
+            (the pool's 0.3%, 0.2% for the swarm's gas, and the price moving). </>}
+          {quote.priceAfter != null && <>The price goes to {quote.priceAfter.toPrecision(4)} USDC. </>}
+          At least {trim(formatUnits((quote.out * 99n) / 100n, outToken.decimals))} {outToken.symbol}, or the swap doesn't happen.
+          {quote.cost > 0.05 && <span className="bad"> The pool is small, so this trade moves the price a lot; a smaller one gets closer to the pool price.</span>}
+        </div>
+      )}
+      <div className="note">
         {quote?.error && <span className="bad">{quote.error} </span>}
         {usdcToken.test
           ? <button type="button" className="linkish" onClick={topUp}>Get 100 test USDC</button>

@@ -72,6 +72,16 @@ export const ROUTER_ABI = parseAbi([
 ]);
 
 const HOOK_ABI = parseAbi(["function collect(address currency) returns (uint256)"]);
+// The PoolManager's events for one pool. Swap amounts are the swapper's:
+// positive is what it got out, before the hook's cut.
+const POOL_EVENTS = parseAbi([
+  "event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)",
+  "event ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)",
+  "event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)",
+]);
+const HISTORY_KEPT = 500;     // pool events kept, newest last
+const LOG_CHUNK = 10000n;     // blocks per getLogs
+const HOOK_SWAP_FEE = 0.002;  // GasSponsorHook's cut of a swap's output
 const POOL_MANAGER_ABI = parseAbi([
   "function balanceOf(address owner, uint256 id) view returns (uint256)",
   "function extsload(bytes32) view returns (bytes32)",
@@ -101,6 +111,13 @@ export function createMarket({ deployment: d, sponsorKey, treasuryKey, rpcUrl, c
   let price = 0n;      // PIPER base units per token
   let piperIs0 = true; // the pool's currency0 is PIPER
   const lastFaucet = new Map(); // address -> ms, for the phone's own USDC faucet
+  const poolId = keccak256(encodeAbiParameters(
+    [{ type: "address" }, { type: "address" }, { type: "uint24" }, { type: "int24" }, { type: "address" }],
+    [d.pool.currency0, d.pool.currency1, d.pool.fee, d.pool.tickSpacing, d.pool.hooks],
+  ));
+  // StateLibrary: the pools mapping is at slot 6; slot0 first, liquidity 3 words on.
+  const stateSlot = BigInt(keccak256(encodeAbiParameters([{ type: "bytes32" }, { type: "uint256" }], [poolId, 6n])));
+  const history = { scannedTo: null, events: [], blockTimes: new Map(), readAt: 0, job: null };
 
   async function init() {
     const read = (address, functionName) => pub.readContract({ address, abi: ERC20_ABI, functionName });
@@ -201,6 +218,7 @@ export function createMarket({ deployment: d, sponsorKey, treasuryKey, rpcUrl, c
         if (e.eventName === "Swapped") amountOut = e.args.amountOut;
       } catch {}
     }
+    history.readAt = 0;
     return { hash, amountOut: String(amountOut) };
   }
 
@@ -238,19 +256,100 @@ export function createMarket({ deployment: d, sponsorKey, treasuryKey, rpcUrl, c
     return { piper: String(piper), usdc: String(usdc) };
   }
 
-  // PIPER's price in USDC from the pool's current sqrt price, read from the
-  // PoolManager's storage (StateLibrary: pools mapping at slot 6).
+  const word = (slot) => pub.readContract({ address: d.poolManager, abi: POOL_MANAGER_ABI, functionName: "extsload", args: [toHex32(slot)] });
+
+  // USDC per PIPER at a sqrt price: sqrt(currency1 units per currency0 unit) as a float.
+  const priceAt = (s) => (piperIs0 ? s * s * 1e12 : 1 / (s * s * 1e-12));
+  const sqrtOf = (sqrtPriceX96) => Number(sqrtPriceX96) / 2 ** 96;
+
+  // PIPER's price in USDC from the pool's current sqrt price, read from the PoolManager's storage.
   async function poolPrice() {
-    const poolId = keccak256(encodeAbiParameters(
-      [{ type: "address" }, { type: "address" }, { type: "uint24" }, { type: "int24" }, { type: "address" }],
-      [d.pool.currency0, d.pool.currency1, d.pool.fee, d.pool.tickSpacing, d.pool.hooks],
-    ));
-    const slot = keccak256(encodeAbiParameters([{ type: "bytes32" }, { type: "uint256" }], [poolId, 6n]));
-    const word = await pub.readContract({ address: d.poolManager, abi: POOL_MANAGER_ABI, functionName: "extsload", args: [slot] });
-    const sqrtPriceX96 = BigInt(word) & ((1n << 160n) - 1n);
-    const raw = Number(sqrtPriceX96) / 2 ** 96;
-    const p = raw * raw; // currency1 units per currency0 unit
-    return piperIs0 ? p * 1e12 : 1 / (p * 1e-12);
+    return priceAt(sqrtOf(BigInt(await word(stateSlot)) & ((1n << 160n) - 1n)));
+  }
+
+  // The pool now: price, tick, liquidity, and the PIPER and USDC its
+  // full-range liquidity holds (L / sqrt P of currency0, L * sqrt P of currency1).
+  async function poolState() {
+    const [slot0, liq] = await Promise.all([word(stateSlot), word(stateSlot + 3n)]);
+    const sqrtPriceX96 = BigInt(slot0) & ((1n << 160n) - 1n);
+    const tick = Number(BigInt.asIntN(24, BigInt(slot0) >> 160n));
+    const liquidity = BigInt(liq) & ((1n << 128n) - 1n);
+    const s = sqrtOf(sqrtPriceX96);
+    const [piperRaw, usdcRaw] = piperIs0 ? [Number(liquidity) / s, Number(liquidity) * s] : [Number(liquidity) * s, Number(liquidity) / s];
+    const piper = piperRaw / 1e18, usdc = usdcRaw / 1e6, price = priceAt(s);
+    return {
+      poolId, price, tick, liquidity: String(liquidity), sqrtPriceX96: String(sqrtPriceX96),
+      piper, usdc, tvlUsdc: usdc + piper * price,
+      fees: { lp: d.pool.fee / 1e6, hookSwap: HOOK_SWAP_FEE, hookDeposit: 0.001 },
+    };
+  }
+
+  // quote(), plus what it means: the pool's price before, the price this
+  // swap gets after every fee, how far that is from the pool's, and the pool's
+  // price after it (full-range math: currency0 in moves 1/sqrt P up by
+  // in / L, currency1 in moves sqrt P up by in / L).
+  async function quoteDetails(side, amountIn) {
+    const [out, state] = await Promise.all([quote(side, amountIn), poolState()]);
+    const L = Number(state.liquidity);
+    const s = sqrtOf(BigInt(state.sqrtPriceX96));
+    const inRaw = Number(amountIn) * (1 - state.fees.lp);
+    const after = zeroForOne(side) ? priceAt(L / (L / s + inRaw)) : priceAt(s + inRaw / L);
+    const [piper, usdc] = side === "buy" ? [Number(out) / 1e18, Number(amountIn) / 1e6] : [Number(amountIn) / 1e18, Number(out) / 1e6];
+    const rate = piper > 0 ? usdc / piper : null;
+    return {
+      amountOut: String(out), side, price: state.price, rate, priceAfter: after,
+      // How much worse than the pool's price, fees included: buyers pay more, sellers get less.
+      cost: rate == null ? null : side === "buy" ? rate / state.price - 1 : 1 - rate / state.price,
+      move: after / state.price - 1,
+    };
+  }
+
+  // The pool's opening, deposits and swaps, read from the PoolManager's
+  // events since the deployment and then only the new blocks; cached 10 s.
+  function poolHistory() {
+    if (history.job) return history.job;
+    if (Date.now() - history.readAt < 10000) return Promise.resolve(historyView());
+    history.job = (async () => {
+      const latest = await pub.getBlockNumber();
+      let from = history.scannedTo != null ? history.scannedTo + 1n : BigInt(d.block ?? 0) - 1000n;
+      if (from < 0n) from = 0n;
+      const logs = [];
+      for (let start = from; start <= latest; start += LOG_CHUNK) {
+        const end = start + LOG_CHUNK - 1n < latest ? start + LOG_CHUNK - 1n : latest;
+        logs.push(...await pub.getLogs({ address: d.poolManager, events: POOL_EVENTS, args: { id: poolId }, fromBlock: start, toBlock: end }));
+      }
+      const blocks = [...new Set(logs.map((l) => l.blockNumber))].filter((b) => !history.blockTimes.has(b));
+      await Promise.all(blocks.map(async (b) => history.blockTimes.set(b, Number((await pub.getBlock({ blockNumber: b })).timestamp) * 1000)));
+      for (const l of logs) history.events.push(poolEvent(l, history.events.at(-1)?.price ?? null));
+      history.events.splice(0, Math.max(0, history.events.length - HISTORY_KEPT));
+      history.scannedTo = latest;
+      history.readAt = Date.now();
+      return historyView();
+    })().finally(() => (history.job = null));
+    return history.job;
+  }
+
+  function poolEvent(l, lastPrice) {
+    const base = { block: Number(l.blockNumber), at: history.blockTimes.get(l.blockNumber), tx: l.transactionHash };
+    const a = l.args;
+    if (l.eventName === "Initialize") return { ...base, type: "open", price: priceAt(sqrtOf(a.sqrtPriceX96)) };
+    if (l.eventName === "ModifyLiquidity") {
+      const s = lastPrice == null ? null : piperIs0 ? Math.sqrt(lastPrice / 1e12) : Math.sqrt(1 / (lastPrice * 1e-12));
+      const L = Math.abs(Number(a.liquidityDelta));
+      const [p0, p1] = s ? [L / s, L * s] : [null, null];
+      const [piper, usdc] = piperIs0 ? [p0, p1] : [p1, p0];
+      return { ...base, type: a.liquidityDelta >= 0n ? "deposit" : "withdraw", price: lastPrice,
+        piper: piper == null ? null : piper / 1e18, usdc: usdc == null ? null : usdc / 1e6 };
+    }
+    const [piperDelta, usdcDelta] = piperIs0 ? [a.amount0, a.amount1] : [a.amount1, a.amount0];
+    return {
+      ...base, type: piperDelta > 0n ? "buy" : "sell", price: priceAt(sqrtOf(a.sqrtPriceX96)),
+      piper: Math.abs(Number(piperDelta)) / 1e18, usdc: Math.abs(Number(usdcDelta)) / 1e6,
+    };
+  }
+
+  function historyView() {
+    return { events: history.events, scannedTo: history.scannedTo == null ? null : Number(history.scannedTo), readAt: history.readAt };
   }
 
   // Deposits' cuts wait in the hook as PoolManager claims; this sends them on.
@@ -284,9 +383,12 @@ export function createMarket({ deployment: d, sponsorKey, treasuryKey, rpcUrl, c
   }
 
   return {
-    init, info, setPrice, openQuery, settleQuery, quote, swap, faucet, usdcFaucet, balances, poolPrice, collectFees, sponsorStatus, sponsor: sponsor.address,
+    init, info, setPrice, openQuery, settleQuery, quote, quoteDetails, swap, faucet, usdcFaucet, balances,
+    poolPrice, poolState, poolHistory, collectFees, sponsorStatus, sponsor: sponsor.address,
   };
 }
+
+const toHex32 = (n) => `0x${n.toString(16).padStart(64, "0")}`;
 
 // The custom error a contract reverted with, as words a phone can show.
 function explain(err) {

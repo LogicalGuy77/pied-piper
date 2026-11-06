@@ -51,6 +51,7 @@ import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import qrcode from "qrcode-generator";
+import { parseUnits } from "viem";
 import { WebSocketServer } from "ws";
 import { createArkivStore, describeError } from "./src/arkiv.js";
 import { costModel, initialCut, paramsModel, placeJoin, repairMove, splitPoint } from "./src/blocks.js";
@@ -190,6 +191,7 @@ function serveStatic(req, res) {
   const path = decodeURIComponent(url.pathname);
   const redirects = {
     "/": "/swarm/web/", "/dashboard": "/swarm/web/dashboard.html", "/manage": "/swarm/web/manage.html", "/arkiv": "/swarm/web/arkiv.html",
+    "/pool": "/swarm/web/pool.html",
   };
   if (redirects[path]) {
     res.writeHead(302, { location: redirects[path] });
@@ -224,6 +226,31 @@ function serveStatic(req, res) {
     if (!market) return sendJson(res, { error: MARKET_OFF ?? "reading the contracts…" }, 503);
     return Promise.all([market.poolPrice(), market.sponsorStatus(), treasuryKey ? market.balances(rewards.info().treasury) : null]).then(
       ([price, sponsor, treasury]) => sendJson(res, { price, sponsor, treasury, info: market.info() }),
+      (err) => sendJson(res, { error: err.shortMessage ?? err.message }, 502),
+    );
+  }
+  if (path === "/market/pool") {
+    if (!market) return sendJson(res, { error: MARKET_OFF ?? "reading the contracts…" }, 503);
+    return Promise.all([market.poolState(), market.poolHistory(), market.sponsorStatus()]).then(
+      ([state, history, sponsor]) => sendJson(res, { state, history, sponsor, info: market.info() }),
+      (err) => sendJson(res, { error: err.shortMessage ?? err.message }, 502),
+    );
+  }
+  // ?side=buy|sell&amount=<USDC or PIPER in>, in whole units: what that swap would give.
+  if (path === "/market/quote") {
+    if (!market) return sendJson(res, { error: MARKET_OFF ?? "reading the contracts…" }, 503);
+    const q = new URL(req.url, "http://x").searchParams;
+    const side = q.get("side");
+    let amountIn;
+    try {
+      if (side !== "buy" && side !== "sell") throw new Error();
+      amountIn = parseUnits(q.get("amount") ?? "", side === "buy" ? 6 : 18);
+      if (amountIn <= 0n) throw new Error();
+    } catch {
+      return sendJson(res, { error: "side must be buy or sell, and amount a positive number" }, 400);
+    }
+    return market.quoteDetails(side, amountIn).then(
+      (quote) => sendJson(res, quote),
       (err) => sendJson(res, { error: err.shortMessage ?? err.message }, 502),
     );
   }
@@ -801,7 +828,7 @@ async function trade(peer, msg) {
   if (!market) return reply({ error: MARKET_OFF ?? "reading the contracts…" });
   if (!peer.wallet) return reply({ error: "this phone has no wallet yet" });
   try {
-    if (msg.type === "quote") return reply({ amountOut: String(await market.quote(msg.side, BigInt(msg.amountIn))) });
+    if (msg.type === "quote") return reply(await market.quoteDetails(msg.side, BigInt(msg.amountIn)));
     if (msg.type === "topup") {
       const hash = await market.usdcFaucet(peer.wallet);
       log(`${peer.id} topped up 100 test USDC: tx ${short(hash)}`);
