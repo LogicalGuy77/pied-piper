@@ -97,7 +97,8 @@ function renderModel() {
 // --- Snapshot tiles ---
 
 function healthOf() {
-  const ready = state.blocks.map((b) => serving().filter((p) => p.block === b.index && p.ready).length);
+  // A phone that has stopped answering doesn't count as ready: its block is about to lose it.
+  const ready = state.blocks.map((b) => serving().filter((p) => p.block === b.index && p.ready && !notAnswering(p)).length);
   const R = replicas();
   const score = ready.reduce((sum, r) => sum + Math.min(r, R) / R, 0) / ready.length;
   const pill = ready.every((r) => r >= R) ? ["green", "Stable"] : ready.every((r) => r >= 1) ? ["amber", "No backup"] : ["red", "Blocked"];
@@ -184,9 +185,15 @@ function renderTiles() {
 
 // --- Swarm map ---
 
+// A ready phone quiet for longer than the heartbeat timeout is only still
+// here because it owes a reply: it is dropped at the busy timeout unless it
+// answers. That is what a frozen tab mid-answer looks like.
+const notAnswering = (p) => p.ready && p.silentMs > state.heartbeatTimeout;
+
 function phoneStatus(p) {
   const r = p.report ?? {};
   if (!p.ready) return ["Loading", "var(--soft)"];
+  if (notAnswering(p)) return [`Not answering ${Math.round(p.silentMs / 1000)} s, dropped at ${Math.round(state.busyTimeout / 1000)} s`, "var(--red)"];
   if (p.silentMs > 2500 && !p.busy) return [`Silent ${Math.round(p.silentMs / 1000)} s`, "var(--red)"];
   if (r.hidden) return ["In background", "var(--red)"];
   if (p.busy) return ["Computing", "var(--purple)"];
@@ -203,7 +210,10 @@ function renderMap() {
   $("mapGrid").innerHTML = state.blocks.map((b) => {
     const holders = serving().filter((p) => p.block === b.index).sort((a, c) => a.joinedAt - c.joinedAt);
     const ready = holders.filter((p) => p.ready).length;
-    const pill = ready >= replicas() ? ["green", `${ready} ready`] : ready === 1 ? ["amber", "no backup"] : ["red", "waiting"];
+    const silent = holders.filter(notAnswering).length;
+    const pill = silent && silent === ready ? ["red", `${silent === 1 ? "its phone" : "every phone"} not answering`]
+      : silent ? ["amber", `${silent} of ${ready} not answering`]
+      : ready >= replicas() ? ["green", `${ready} ready`] : ready === 1 ? ["amber", "no backup"] : ["red", "waiting"];
     const shown = holders.filter((p) => matches(p.id, p.report?.device, `block ${b.index + 1}`));
     const phones = shown.map((p) => {
       const [label, color] = phoneStatus(p);
@@ -213,7 +223,7 @@ function renderMap() {
         <div class="av" style="background:${ks(b.index)};color:${kc(b.index)}">${esc(p.id)}</div>
         <div class="who"><b>Phone ${esc(p.id)}<i class="st" style="background:${color}"></i></b><span title="${esc(detail)}">${esc(detail)}</span></div></div>`;
     }).join("");
-    return `<div class="blk">
+    return `<div class="blk${silent ? " alarm" : ""}">
       <div class="blk-head"><i style="background:${kc(b.index)}"></i><b>Block ${b.index + 1}</b><span class="pill ${pill[0]}">${pill[1]}</span></div>
       <div class="holds">${esc(blockLabel(b))} · ${b.bytes ? fmt.bytes(b.bytes) : ""}</div>
       ${phones || `<div class="empty">${holders.length ? "No match" : "No phone yet. Scan the QR code."}</div>`}</div>`;

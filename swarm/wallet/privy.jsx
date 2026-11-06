@@ -8,7 +8,7 @@ import {
   PrivyProvider, useCreateWallet, useGuestAccounts, usePrivy, useSignMessage, useSignTypedData,
 } from "@privy-io/react-auth";
 import { useEffect, useRef, useState } from "react";
-import { unichainSepolia } from "viem/chains";
+import { sepolia } from "viem/chains";
 import { Earnings } from "./earnings.jsx";
 
 export function PrivyApp({ ctx }) {
@@ -19,8 +19,8 @@ export function PrivyApp({ ctx }) {
       config={{
         loginMethods: ["email", "sms"],
         embeddedWallets: { ethereum: { createOnLogin: "users-without-wallets" } },
-        supportedChains: [unichainSepolia],
-        defaultChain: unichainSepolia,
+        supportedChains: [sepolia],
+        defaultChain: sepolia,
         appearance: { theme: dark ? "dark" : "light", accentColor: dark ? "#4fc3cd" : "#0b7a85" },
       }}
     >
@@ -66,8 +66,11 @@ function PrivyWallet({ ctx }) {
       .catch((err) => setProblem(`Couldn't link the wallet: ${err.message}`));
   }, [address]);
 
-  // Withdrawing does prompt: Privy shows what is being signed.
+  // Withdrawing and swapping do prompt: Privy shows what is being signed. A
+  // question's payment doesn't; its most is set on the card.
   const sign = async (typedData) => (await signTypedData(jsonSafe(typedData), { address })).signature;
+  const signQuietly = async (typedData) =>
+    (await signTypedData(jsonSafe(typedData), { address, uiOptions: { showWalletUIs: false } })).signature;
 
   let account;
   if (!ready) {
@@ -96,7 +99,7 @@ function PrivyWallet({ ctx }) {
       </div>
     );
   }
-  return <Earnings ctx={ctx} address={address} sign={sign} problem={problem} account={account} />;
+  return <Earnings ctx={ctx} address={address} sign={sign} signQuietly={signQuietly} problem={problem} account={account} />;
 }
 
 // Privy hands typed data to its wallet as JSON, which has no bigints.

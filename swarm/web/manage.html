@@ -38,6 +38,12 @@
     .bad { color: var(--red); }
     .warn { color: var(--amber); }
     .note { font-size: 12px; color: var(--muted); margin-top: 10px; }
+    .faucet { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 14px 0; }
+    .faucet input, .faucet select { font: inherit; padding: 6px 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--page); color: var(--ink); }
+    .faucet input { width: 6em; text-align: right; }
+    .faucet button { font: 600 13px var(--sans); padding: 7px 14px; border-radius: 10px; border: 0; background: var(--purple); color: #fff; cursor: pointer; }
+    .faucet button:disabled { opacity: .5; }
+    .mono { font-family: var(--mono); font-size: 12px; }
   </style>
 </head>
 <body>
@@ -59,6 +65,23 @@
     <table id="blocks"></table>
     <div class="note">Capacity is how many generated tokens per second the block's phones could run if they did
       nothing else: the sum of 1000 ÷ compute ms per token. The block with the least capacity limits the swarm.</div>
+  </section>
+
+  <section class="card">
+    <h2>Economy: PIPER on Sepolia</h2>
+    <div class="tiles" id="economy"><div class="muted">Reading the chain…</div></div>
+    <form id="faucet" class="faucet">
+      <b>Faucet</b>
+      <select id="faucet-phone"></select>
+      <label><input id="faucet-piper" value="50" inputmode="decimal"> PIPER</label>
+      <label><input id="faucet-usdc" value="0" inputmode="decimal"> USDC</label>
+      <button>Send from the treasury</button>
+      <span id="faucet-result" class="muted"></span>
+    </form>
+    <table id="wallets"></table>
+    <div class="note">Phones earn PIPER for the parameter-ops they compute and pay PIPER for their questions. The faucet
+      sends a phone PIPER from the treasury so it can ask before it has earned any. The gas sponsor pays the gas of every
+      transaction a phone only signs; the pool's hook sends it a cut of every swap and deposit.</div>
   </section>
 
   <section class="card">

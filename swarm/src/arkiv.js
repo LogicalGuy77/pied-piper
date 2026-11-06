@@ -5,6 +5,7 @@
 //   const arkiv = createArkivStore({ privateKey, accessKey, model })   // null without a key
 //   await arkiv.save({ chatId, messages, metrics })   // creates the chat's entity, or updates it
 //   await arkiv.list()                                 // the saver's entities, read back from the chain
+//   await arkiv.lookup(query)                          // one conversation by tx hash, entity key or chat id
 //
 // One chat is one entity. Its first answer creates it; every answer after
 // that patches the messages and metrics and pushes the expiry a day out, in
@@ -13,11 +14,11 @@
 // Writes go out one at a time: they share the saver wallet's nonce, and two
 // writes to one chat must land in order.
 
-import { createPublicClient, createWalletClient, ExpirationTime, NoEntityFoundError } from "@arkiv-network/sdk";
+import { createPublicClient, createWalletClient, ENTITY_EVENTS_ABI, ExpirationTime, NoEntityFoundError } from "@arkiv-network/sdk";
 import { rabdi } from "@arkiv-network/sdk/chains";
-import { desc, eq } from "@arkiv-network/sdk/query";
-import { bytes, defineSchema, str, u64 } from "@arkiv-network/sdk/schema";
-import { hexToString, http, isHex, stringToBytes } from "viem";
+import { desc, eq, startsWith } from "@arkiv-network/sdk/query";
+import { bytes, defineSchema, key, str, u64 } from "@arkiv-network/sdk/schema";
+import { decodeEventLog, hexToString, http, isHex, stringToBytes } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
 export const SCHEMA_NAME = "pied-piper.conversation.v1";
@@ -168,46 +169,90 @@ export function createArkivStore({ privateKey, accessKey = "", model = "unknown"
     list({ limit = 20 } = {}) {
       if (listCache && Date.now() - listCache.at < 3000) return listCache.promise;
       const promise = (async () => {
-        const [timing, page] = await Promise.all([
-          publicClient.getBlockTiming(),
-          publicClient
-            .select({
-              $key: true, $expiresAt: true, $createdAt: true, $updatedAt: true,
-              chatId: true, model: true, turns: true, tokens: true, updatedMs: true, messages: true, metrics: true,
-            })
-            .from(Conversations)
-            .ownedBy(account.address)
-            .orderBy(desc("updatedMs"))
-            .limit(limit)
-            .fetch(),
-        ]);
-        const block = timing.currentBlock;
-        return {
-          readAt: Date.now(),
-          currentBlock: Number(block),
-          blockSeconds: timing.blockDuration,
-          entities: page.entities.map((e) => ({
-            key: e.$key,
-            url: links.entity(e.$key),
-            createdAtBlock: Number(e.$createdAt),
-            updatedAtBlock: Number(e.$updatedAt),
-            expiresAtBlock: Number(e.$expiresAt),
-            expiresInSec: Number(e.$expiresAt - block) * timing.blockDuration,
-            chatId: e.chatId.value,
-            model: e.model.value,
-            turns: Number(e.turns.value),
-            tokens: Number(e.tokens.value),
-            updatedMs: Number(e.updatedMs.value),
-            messages: parseJson(e.messages.value, []),
-            metrics: parseJson(e.metrics.value, []),
-          })),
-        };
+        const { timing, entities } = await conversations((q) => q.ownedBy(account.address).orderBy(desc("updatedMs")).limit(limit));
+        return { readAt: Date.now(), currentBlock: Number(timing.currentBlock), blockSeconds: timing.blockDuration, entities };
       })();
       listCache = { at: Date.now(), promise };
       promise.catch(() => (listCache = null));
       return promise;
     },
+
+    // q: a transaction hash (the conversation it wrote, and which turns it
+    // saved), an entity key, or a chat id or its start. Entities from any
+    // wallet are found by key or transaction; chat ids only from the saver's.
+    async lookup(q) {
+      q = String(q ?? "").trim();
+      const base = { query: q, readAt: Date.now() };
+      if (/^0x[0-9a-fA-F]{64}$/.test(q)) {
+        const tx = await readTx(q);
+        if (tx) {
+          if (!tx.entityKey) return { ...base, kind: "tx", tx, entities: [], note: "this transaction wrote no conversation" };
+          const { entities } = await conversations((s) => s.where(eq("$key", key(tx.entityKey))).limit(1));
+          for (const e of entities) e.savedAtTx = e.metrics.filter((m) => Date.parse(m.at) <= tx.timeMs).length;
+          return { ...base, kind: "tx", tx, entities, note: entities.length ? null : "the conversation it wrote has expired" };
+        }
+        const { entities } = await conversations((s) => s.where(eq("$key", key(q))).limit(1));
+        return { ...base, kind: "entity", entities, note: entities.length ? null : "no transaction or live entity with this hash on Rabdi" };
+      }
+      if (!/^[A-Za-z0-9-]{4,64}$/.test(q)) {
+        return { ...base, kind: "none", entities: [], note: "type a transaction hash, an entity key (0x and 64 hex digits) or a chat id" };
+      }
+      const { entities } = await conversations((s) => s.where(startsWith("chatId", q)).ownedBy(account.address).orderBy(desc("updatedMs")).limit(10));
+      return { ...base, kind: "chat", entities, note: entities.length ? null : "no live conversation with that chat id" };
+    },
   };
+
+  // Our schema's entities that `build` picks, as plain objects for the page.
+  async function conversations(build) {
+    const [timing, page] = await Promise.all([
+      publicClient.getBlockTiming(),
+      build(publicClient
+        .select({
+          $key: true, $owner: true, $expiresAt: true, $createdAt: true, $updatedAt: true,
+          chatId: true, model: true, turns: true, tokens: true, updatedMs: true, messages: true, metrics: true,
+        })
+        .from(Conversations)).fetch(),
+    ]);
+    const block = timing.currentBlock;
+    const entities = page.entities.map((e) => ({
+      key: e.$key,
+      url: links.entity(e.$key),
+      owner: e.$owner,
+      mine: e.$owner?.toLowerCase() === account.address.toLowerCase(),
+      createdAtBlock: Number(e.$createdAt),
+      updatedAtBlock: Number(e.$updatedAt),
+      expiresAtBlock: Number(e.$expiresAt),
+      expiresInSec: Number(e.$expiresAt - block) * timing.blockDuration,
+      chatId: e.chatId.value,
+      model: e.model.value,
+      turns: Number(e.turns.value),
+      tokens: Number(e.tokens.value),
+      updatedMs: Number(e.updatedMs.value),
+      messages: parseJson(e.messages.value, []),
+      metrics: parseJson(e.metrics.value, []),
+    }));
+    return { timing, entities };
+  }
+
+  // The transaction's block, sender, what it did and the entity it wrote; null if Rabdi doesn't know it.
+  async function readTx(hash) {
+    const receipt = await publicClient.getTransactionReceipt({ hash }).catch(() => null);
+    if (!receipt) return null;
+    const block = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
+    const ops = [];
+    let entityKey = null;
+    for (const log of receipt.logs) {
+      try {
+        const e = decodeEventLog({ abi: ENTITY_EVENTS_ABI, topics: log.topics, data: log.data });
+        ops.push(e.eventName);
+        entityKey ??= e.args.entityKey;
+      } catch {}
+    }
+    return {
+      hash, url: links.tx(hash), from: receipt.from, block: Number(receipt.blockNumber),
+      timeMs: Number(block.timestamp) * 1000, status: receipt.status, ops, entityKey,
+    };
+  }
 }
 
 // Drops the oldest messages and metrics until both fit in one entity.

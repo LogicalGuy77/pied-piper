@@ -36,6 +36,8 @@
     .block .holds { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
     .block .count { font-size: 12px; margin-top: 6px; font-variant-numeric: tabular-nums; color: var(--ink-2); }
     .block .warn { font-size: 11.5px; color: var(--red); }
+    /* A holder has stopped answering past the heartbeat timeout: the block is in danger. */
+    .block.alarm { border-color: var(--red); box-shadow: 0 0 0 2px var(--red-soft); }
     #routes { margin-top: 12px; font-size: 12.5px; color: var(--muted); }
     .chat-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
     .chat-head h2 { margin: 0; }
@@ -71,6 +73,8 @@
     .wallet-withdraw button { font: 600 13.5px var(--sans); padding: 9px 16px; border-radius: 12px; border: 0; background: var(--purple); color: #fff; cursor: pointer; }
     .wallet-withdraw button:disabled { opacity: .5; cursor: default; }
     .wallet-withdraw .note { flex-basis: 100%; margin-top: 0; }
+    .wallet-withdraw select { flex: 1 1 100%; font: inherit; font-size: 14px; padding: 9px 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--page); color: var(--ink); }
+    .wallet-spend { width: 4.5em; font: inherit; padding: 2px 6px; border-radius: 8px; border: 1px solid var(--line); background: var(--page); color: var(--ink); text-align: right; }
     #wallet button:not(.linkish) { font: 600 13px var(--sans); padding: 8px 14px; border-radius: 12px; border: 0; background: var(--purple); color: #fff; cursor: pointer; }
     #wallet button:disabled { opacity: .5; cursor: default; }
     .arkiv-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
@@ -97,7 +101,7 @@
   </section>
 
   <section class="card earn">
-    <h2>Earnings <span class="tag">PIPER</span></h2>
+    <h2>Wallet <span class="tag">PIPER</span></h2>
     <div id="wallet" class="muted">Setting up this phone's wallet…</div>
   </section>
 

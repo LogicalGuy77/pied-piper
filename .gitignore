@@ -8,3 +8,4 @@ certs/
 .env
 swarm/web/dist/
 swarm/data/
+swarm/chain/out/

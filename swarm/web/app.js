@@ -47,11 +47,16 @@ function renderSwarm() {
   if (mine) $("title").innerHTML = `Phone ${me} · <em>Block ${mine.index + 1}</em>`; // indices shift when an earlier block splits
   $("blocks").style.setProperty("--n", Math.min(blocks.length, 4));
   $("blocks").replaceChildren(...swarm.blocks.map((b) => {
-    const { ready, loading } = swarm.holders[b.index];
+    const { ready, loading, silent = 0 } = swarm.holders[b.index];
     const el = document.createElement("div");
-    el.className = b.id === myBlock ? "block mine" : "block";
-    const count = `${ready} ready${loading ? ` · ${loading} loading` : ""}`;
-    const warn = ready === 0 ? "no phone yet" : ready === 1 ? "only one phone" : "";
+    el.className = `block${b.id === myBlock ? " mine" : ""}${silent ? " alarm" : ""}`;
+    const count = `${ready - silent} ready${silent ? ` · ${silent} not answering` : ""}${loading ? ` · ${loading} loading` : ""}`;
+    // A ready phone that has gone quiet is dropped at the busy timeout, and
+    // its answers rerouted, if it has not replied by then.
+    const warn = ready === 0 ? "no phone yet"
+      : silent === ready ? `${silent === 1 ? "its phone" : "every phone"} stopped answering: dropped in ${Math.round((swarm.busyTimeout ?? 20000) / 1000)} s unless it replies`
+      : silent ? "one phone stopped answering, another can take over"
+      : ready === 1 ? "only one phone" : "";
     el.innerHTML = `<div class="name"><i style="background:var(--k${b.index % 6})"></i>Block ${b.index + 1}`
       + `${b.id === myBlock ? '<span class="you">YOU</span>' : ""}</div>`
       + `<div class="holds">${blockLabel(b)}</div>`
@@ -113,15 +118,18 @@ worker.onmessage = ({ data: e }) => {
     stats.className = "stats";
     const rerouted = e.reroutes ? ` · rerouted ${e.reroutes}× when a phone left` : "";
     const cached = e.cached ? ` · ${e.cached} of ${e.prompt} prompt tokens already cached` : "";
-    stats.textContent = `route ${answerEl.dataset.route} · ${e.tokens} tokens · first token ${(e.firstMs / 1000).toFixed(1)} s · then ${e.msPerToken.toFixed(0)} ms per token${cached}${rerouted}`;
-    answerEl.append(stats);
+    const limit = e.finish === "limit" ? " · stopped at the token limit you paid for" : "";
+    stats.textContent = `route ${answerEl.dataset.route} · ${e.tokens} tokens · first token ${(e.firstMs / 1000).toFixed(1)} s · then ${e.msPerToken.toFixed(0)} ms per token${cached}${rerouted}${limit}`;
+    answerEl.querySelector(".pay") ? answerEl.insertBefore(stats, answerEl.querySelector(".pay")) : answerEl.append(stats);
     // The tracker saves the conversation to Arkiv; "recorded" says how it went.
     if (!answerEl.querySelector(".arkiv")) answerEl.append(arkivLine("Saving this chat to Arkiv…"));
     finishAsk();
   } else if (e.type === "recorded") {
     showRecorded(e);
-  } else if (e.type === "wallet" || e.type === "withdrawn") {
+  } else if (e.type === "wallet" || e.type === "withdrawn" || e.type === "walletReply") {
     wallet ? wallet.update(e) : walletEvents.push(e);
+  } else if (e.type === "query") {
+    showQuery(e);
   } else if (e.type === "error") {
     messages.pop(); // the question didn't get an answer; don't keep it in the conversation
     answerEl.classList.add("error");
@@ -140,7 +148,7 @@ function finishAsk() {
   setInputEnabled();
 }
 
-$("form").addEventListener("submit", (ev) => {
+$("form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const text = $("input").value.trim();
   if (!text || busy) return;
@@ -150,8 +158,48 @@ $("form").addEventListener("submit", (ev) => {
   answerEl = addMessage("assistant", "");
   busy = true;
   setInputEnabled();
-  worker.postMessage({ type: "ask", text, messages, maxNew: MAX_NEW, chatId });
+  // Asking is paid: the wallet signs the most this answer may cost.
+  let payment = null;
+  if (walletConfig?.paidAsks) {
+    try {
+      if (!wallet) throw new Error("the wallet isn't ready yet");
+      payment = await wallet.pay(text);
+    } catch (err) {
+      messages.pop();
+      answerEl.classList.add("error");
+      answerEl.textContent = `Not asked: ${err.message}`;
+      return finishAsk();
+    }
+    answerEl.append(document.createTextNode(""), payLine("Paying for this answer…")); // tokens stream into the text node
+  }
+  worker.postMessage({ type: "ask", text, messages, maxNew: MAX_NEW, chatId, payment });
 });
+
+// --- Paying for answers in PIPER (src/market.js) ---
+
+function payLine(text) {
+  const el = document.createElement("div");
+  el.className = "stats pay";
+  el.textContent = text;
+  return el;
+}
+
+const piper = (units) => (Number(units) / 1e18).toFixed(4).replace(/\.?0+$/, "");
+
+// "opened": the payment is escrowed on-chain; "settled": charged for the tokens run, the rest refunded.
+function showQuery(e) {
+  if (e.state === "opened") answerEl.dataset.query = e.id;
+  const el = document.querySelector(`.msg.assistant[data-query="${e.id}"]`);
+  if (!el) return;
+  const line = el.querySelector(".pay") ?? el.appendChild(payLine(""));
+  const tx = link(`${walletConfig.explorer}/tx/${e.hash}`, shortHex(e.hash));
+  line.replaceChildren();
+  if (e.state === "opened") {
+    line.append(`Escrowed up to ${piper(e.maxPayment)} PIPER for ${e.maxTokens} tokens · tx `, tx);
+  } else {
+    line.append(`Paid ${piper(e.cost)} PIPER for ${e.tokens} tokens, ${piper(e.refund)} refunded · tx `, tx);
+  }
+}
 
 // The phones on the route keep this conversation's KV caches, so a follow-up
 // only sends its new tokens. A new chat frees them and starts from nothing.
@@ -241,11 +289,12 @@ $("peek").addEventListener("click", () => openArkiv($("arkiv").hidden));
 // --- Earnings: this phone's wallet (swarm/wallet/, built to dist/) ---
 
 let wallet = null;
+let walletConfig = null;
 const walletEvents = []; // from the tracker before the wallet card is up
 
 async function startWallet(challenge) {
   try {
-    const config = await (await fetch("/wallet/config")).json();
+    const config = (walletConfig = await (await fetch("/wallet/config")).json());
     const { mountWallet } = await import("./dist/wallet.js");
     $("wallet").classList.remove("muted");
     const send = (msg) => worker.postMessage({ type: "to-tracker", msg });

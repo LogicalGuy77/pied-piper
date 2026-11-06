@@ -22,15 +22,27 @@
 // metrics are saved to Arkiv's Rabdi testnet (src/arkiv.js), and /arkiv shows
 // what is there.
 //
-// Rewards: every phone gets a wallet with no sign-up (a Privy guest wallet,
+// PIPER: every phone gets a wallet with no sign-up (a Privy guest wallet,
 // with PRIVY_APP_ID; otherwise one kept in the browser), proves it holds it
-// by signing a challenge (src/wallet-auth.js), and earns PIPER USDC for
-// the layer-tokens it serves (src/rewards.js). With TREASURY_PRIVATE_KEY and
-// a deployed token (chain/deploy.js), the treasury pays out on Unichain
-// Sepolia every --payout-every ms, and submits withdrawals for phones.
-//   [--reward 0.000001] pUSDC per layer-token   [--payout-min 0.01]   [--payout-every 60000]
+// by signing a challenge (src/wallet-auth.js), and earns --reward PIPER for
+// every --reward-params parameter-ops it computes (src/rewards.js). Once
+// chain/deploy.js has deployed everything on Sepolia:
+//  - the treasury pays phones every --payout-every ms;
+//  - asking costs PIPER: the phone signs the most it will pay, the gas
+//    sponsor opens the query on-chain, the answer stops at the stop token or
+//    the token limit that pays for, and the sponsor settles it for the
+//    tokens run, refunding the rest (src/market.js). --free-asks turns this off;
+//    clients (api.js) never pay;
+//  - phones swap PIPER and USDC on the Uniswap v4 pool with a signature;
+//  - /manage#key=… (printed at start) can send a phone PIPER from the faucet.
+// The gas sponsor (SPONSOR_PRIVATE_KEY) pays the gas of everything phones
+// only sign; the pool's hook pays it a cut of every swap and deposit.
+// An answer token costs --price-margin times what the phones earn for it
+// through the whole model, rounded to 0.001 PIPER; the tracker sets that
+// price on the market when it starts.
+//   [--reward 1] [--reward-params 1e9] [--payout-min 1] [--payout-every 60000] [--free-asks] [--price-margin 1.5]
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createReadStream, readdirSync, readFileSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { createServer as createTlsServer } from "node:https";
@@ -41,7 +53,8 @@ import { parseArgs } from "node:util";
 import qrcode from "qrcode-generator";
 import { WebSocketServer } from "ws";
 import { createArkivStore, describeError } from "./src/arkiv.js";
-import { costModel, initialCut, placeJoin, repairMove, splitPoint } from "./src/blocks.js";
+import { costModel, initialCut, paramsModel, placeJoin, repairMove, splitPoint } from "./src/blocks.js";
+import { createMarket } from "./src/market.js";
 import { KIND, readHeader } from "./src/protocol.js";
 import { createRewards } from "./src/rewards.js";
 import { newNonce, verifyWallet, walletChallenge } from "./src/wallet-auth.js";
@@ -66,8 +79,11 @@ const { values: opts } = parseArgs({
     "heartbeat-timeout": { type: "string", default: "5000" },
     "busy-timeout": { type: "string", default: "20000" },
     "session-idle": { type: "string", default: "600000" },
-    reward: { type: "string", default: "0.000001" },
-    "payout-min": { type: "string", default: "0.01" },
+    reward: { type: "string", default: "1" },
+    "reward-params": { type: "string", default: "1e9" },
+    "payout-min": { type: "string", default: "1" },
+    "free-asks": { type: "boolean", default: false },
+    "price-margin": { type: "string", default: "1.5" },
     "payout-every": { type: "string", default: "60000" },
     ledger: { type: "string", default: join(ROOT, "swarm", "data", "rewards.json") },
   },
@@ -103,6 +119,7 @@ const weightsVersion = versionOf(resolve(opts.weights));
 // block splits; id stays the same for a block's lifetime, index is its place.
 const manifest = JSON.parse(readFileSync(join(resolve(opts.weights), "manifest.json"), "utf8"));
 const cost = costModel(manifest);
+const params = paramsModel(manifest);
 let blocks;
 try {
   const bounds = initialCut(manifest, Number(opts["min-blocks"]));
@@ -125,26 +142,36 @@ try {
 }
 const ARKIV_OFF = "Arkiv is off: set ARKIV_PRIVATE_KEY in swarm/.env and restart the tracker";
 
-// The token is PIPER_TOKEN, or the one chain/deploy.js deployed.
+// The contracts chain/deploy.js deployed (PIPER_DEPLOYMENT: another file of them).
 const PRIVY_APP_ID = process.env.PRIVY_APP_ID?.trim() || null;
 let deployment = null;
 try {
-  deployment = JSON.parse(readFileSync(join(ROOT, "swarm", "chain", "deployment.json"), "utf8"));
+  deployment = JSON.parse(readFileSync(process.env.PIPER_DEPLOYMENT?.trim() || join(ROOT, "swarm", "chain", "deployment.json"), "utf8"));
+  if (!deployment.piper) deployment = null; // the old single-token deployment
 } catch {}
 const treasuryKey = process.env.TREASURY_PRIVATE_KEY?.trim() || null;
-const tokenAddress = process.env.PIPER_TOKEN?.trim() || deployment?.token || null;
+const sponsorKey = process.env.SPONSOR_PRIVATE_KEY?.trim() || null;
+const rpcUrl = process.env.CHAIN_RPC_URL?.trim() || undefined;
 const rewards = createRewards({
   file: resolve(opts.ledger),
-  rewardPerLayerToken: opts.reward,
+  rewardPerUnit: opts.reward,
+  unitParams: Number(opts["reward-params"]),
   payoutMin: opts["payout-min"],
-  chain: treasuryKey && tokenAddress
-    ? { privateKey: treasuryKey, token: tokenAddress, rpcUrl: process.env.CHAIN_RPC_URL?.trim() || undefined }
-    : null,
-  log: (line) => log(line),
+  chain: treasuryKey && deployment ? { privateKey: treasuryKey, relayerKey: sponsorKey, token: deployment.piper, rpcUrl } : null,
+  log: (line) => queueMicrotask(() => log(line)), // may log while loading the ledger, before log() can run
 });
+const REWARD_PER_TOKEN = (Number(opts.reward) * params({ start: 0, end: manifest.config.num_layers })) / Number(opts["reward-params"]);
+const PRICE_PER_TOKEN = BigInt(Math.max(1, Math.round(REWARD_PER_TOKEN * Number(opts["price-margin"]) * 1000))) * 10n ** 15n;
 const PAYOUTS_OFF = !treasuryKey
   ? "set TREASURY_PRIVATE_KEY in swarm/.env"
-  : "deploy the token first: node swarm/chain/deploy.js";
+  : "deploy first: node swarm/chain/deploy.js";
+// Paid questions, swaps and the faucet. null until it has read the chain.
+let market = null;
+const MARKET_OFF = !deployment ? "deploy first: node swarm/chain/deploy.js" : !sponsorKey ? "set SPONSOR_PRIVATE_KEY in swarm/.env" : null;
+const pendingMarket = MARKET_OFF ? null
+  : createMarket({ deployment, sponsorKey, treasuryKey, rpcUrl, log: (line) => log(line) });
+// /manage's faucet needs this key, since phones load pages from the same server.
+const MANAGE_KEY = process.env.MANAGE_KEY?.trim() || randomBytes(12).toString("hex");
 
 // --- HTTP: the page, the code it imports, and the weights ---
 
@@ -183,16 +210,36 @@ function serveStatic(req, res) {
       payoutsOff: info.payouts ? null : PAYOUTS_OFF,
       token: info.token,
       explorer: info.explorer,
-      reward: info.rewardPerLayerToken,
+      reward: info.rewardPerUnit,
+      rewardParams: info.unitParams,
+      paramsPerToken: params({ start: 0, end: manifest.config.num_layers }),
       payoutMin: info.payoutMin,
       payoutEvery: Number(opts["payout-every"]),
+      market: market ? market.info() : null,
+      marketOff: market ? null : MARKET_OFF ?? "reading the contracts…",
+      paidAsks: !!market && !opts["free-asks"],
     });
   }
+  if (path === "/market/status") {
+    if (!market) return sendJson(res, { error: MARKET_OFF ?? "reading the contracts…" }, 503);
+    return Promise.all([market.poolPrice(), market.sponsorStatus(), treasuryKey ? market.balances(rewards.info().treasury) : null]).then(
+      ([price, sponsor, treasury]) => sendJson(res, { price, sponsor, treasury, info: market.info() }),
+      (err) => sendJson(res, { error: err.shortMessage ?? err.message }, 502),
+    );
+  }
+  if (path === "/manage/faucet" && req.method === "POST") return manageFaucet(req, res);
   if (path === "/arkiv/info") return sendJson(res, arkiv ? arkiv.info() : { enabled: false, reason: ARKIV_OFF });
   if (path === "/arkiv/entities") {
     if (!arkiv) return sendJson(res, { error: ARKIV_OFF }, 503);
     return arkiv.list().then(
       (list) => sendJson(res, list),
+      (err) => sendJson(res, { error: `reading from Arkiv failed: ${describeError(err)}` }, 502),
+    );
+  }
+  if (path === "/arkiv/lookup") {
+    if (!arkiv) return sendJson(res, { error: ARKIV_OFF }, 503);
+    return arkiv.lookup(new URL(req.url, "http://x").searchParams.get("q")).then(
+      (found) => sendJson(res, found),
       (err) => sendJson(res, { error: `reading from Arkiv failed: ${describeError(err)}` }, 502),
     );
   }
@@ -220,6 +267,35 @@ function serveStatic(req, res) {
 function sendJson(res, body, status = 200) {
   res.writeHead(status, { "content-type": TYPES[".json"], "cache-control": "no-cache" });
   res.end(JSON.stringify(body));
+}
+
+// The faucet: the treasury sends a phone PIPER (and test USDC), so it can ask
+// before it has earned anything. Body: { peer, piper, usdc }.
+async function manageFaucet(req, res) {
+  const key = Buffer.from(String(req.headers["x-manage-key"] ?? ""));
+  if (key.length !== MANAGE_KEY.length || !timingSafeEqual(key, Buffer.from(MANAGE_KEY))) {
+    return sendJson(res, { error: "wrong management key: open the /manage link the tracker printed" }, 403);
+  }
+  if (!market) return sendJson(res, { error: MARKET_OFF ?? "reading the contracts…" }, 503);
+  let body;
+  try {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+  } catch {
+    return sendJson(res, { error: "bad request" }, 400);
+  }
+  const peer = peers.get(body.peer);
+  if (!peer?.wallet) return sendJson(res, { error: `phone ${body.peer} has no wallet linked` }, 404);
+  const amount = (x) => (/^\d+(\.\d+)?$/.test(String(x ?? "0")) ? String(x ?? "0") : "0");
+  try {
+    const sent = await market.faucet(peer.wallet, { piper: amount(body.piper), usdc: amount(body.usdc) });
+    log(`faucet: sent ${[body.piper > 0 && `${body.piper} PIPER`, body.usdc > 0 && `${body.usdc} USDC`].filter(Boolean).join(" and ")} to ${peer.id} (${short(peer.wallet)})`);
+    await refreshWallet(peer.wallet);
+    sendJson(res, sent);
+  } catch (err) {
+    sendJson(res, { error: err.shortMessage ?? err.message }, 502);
+  }
 }
 
 // --- The swarm ---
@@ -401,6 +477,7 @@ function endSession(id, why = null) {
   }
   if (s.active) logAnswer(id, s, why);
   else if (why) log(`session ${id} ${why}`);
+  settleQuery(id, s);
   changed();
 }
 
@@ -449,7 +526,7 @@ function connect(id) {
   for (const p of route) p.sessions.add(id);
   const name = s.turn > 1 ? `session ${id} turn ${s.turn}` : `session ${id}`;
   if (s.request != null) {
-    send(peers.get(s.asker), { type: "session", requestId: s.request, session: id, route: s.route, attempt: s.attempt });
+    send(peers.get(s.asker), { type: "session", requestId: s.request, session: id, route: s.route, attempt: s.attempt, maxTokens: s.query?.maxTokens });
     s.request = null;
     log(`${name}: ${s.asker} asks via ${s.route.join(" → ")}${s.context ? `, replaying ${s.context} tokens` : ""}`);
   } else {
@@ -467,15 +544,20 @@ function connectWaiting() {
 // everything. Sending every phone the full swarm on every token grows with
 // the square of the number of phones.
 function summary() {
-  const holders = blocks.map(() => ({ ready: 0, loading: 0 }));
+  // silent: ready phones quiet for longer than the heartbeat timeout. They
+  // are only still here because they owe a reply (the busy timeout); a
+  // frozen tab mid-answer looks like this until it is dropped.
+  const holders = blocks.map(() => ({ ready: 0, loading: 0, silent: 0 }));
+  const now = Date.now();
   let phones = 0;
   for (const p of peers.values()) {
     if (!p.block) continue; // a client
     holders[p.block.index][p.ready ? "ready" : "loading"]++;
+    if (p.ready && now - p.lastSeen > HEARTBEAT_TIMEOUT) holders[p.block.index].silent++;
     phones++;
   }
   const answering = [...sessions.values()].filter((s) => s.active).length;
-  return JSON.stringify({ type: "swarm", blocks, holders, phones, sessions: answering });
+  return JSON.stringify({ type: "swarm", blocks, holders, phones, sessions: answering, busyTimeout: BUSY_TIMEOUT });
 }
 
 function fullState() {
@@ -546,30 +628,7 @@ function onControl(peer, msg) {
     log(`${peer.id} ready with block ${peer.block.index + 1}`);
     connectWaiting();
   } else if (msg.type === "ask") {
-    const now = Date.now();
-    const old = sessions.get(msg.session);
-    if (old?.asker === peer.id && !old.active) {
-      // The next question of a conversation: same route, its KV caches still there.
-      old.turn++;
-      newTurn(old, now);
-      if (old.waitingSince) {
-        old.request = msg.requestId; // its route is still being rebuilt; answered by connect()
-        return changed();
-      }
-      send(peer, { type: "session", requestId: msg.requestId, session: msg.session, route: old.route, attempt: old.attempt });
-      log(`session ${msg.session} turn ${old.turn}: ${peer.id} asks again via ${old.route.join(" → ")}, ${old.context} tokens cached`);
-      return changed();
-    }
-    const empty = blocks.find((b) => !holdersOf(b).length);
-    if (empty) {
-      return send(peer, { type: "error", requestId: msg.requestId, message: `waiting for block ${empty.index + 1}: no phone holds it yet` });
-    }
-    // Every block has a phone; if some are still loading, the question waits for them.
-    const id = nextSession++;
-    const s = { asker: peer.id, route: [], attempt: 0, reroutes: 0, context: 0, turn: 1, idleSince: 0, request: msg.requestId, waitingSince: now };
-    newTurn(s, now);
-    sessions.set(id, s);
-    if (!connect(id)) log(`session ${id}: ${peer.id} asks, waiting for phones to load`);
+    return ask(peer, msg);
   } else if (msg.type === "turn") {
     // The asker has its answer and keeps the conversation for its next question.
     const s = sessions.get(msg.session);
@@ -577,6 +636,7 @@ function onControl(peer, msg) {
     logAnswer(msg.session, s);
     s.active = false;
     s.idleSince = Date.now();
+    settleQuery(msg.session, s);
   } else if (msg.type === "end") {
     if (sessions.get(msg.session)?.asker === peer.id) endSession(msg.session);
   } else if (msg.type === "fail") {
@@ -593,8 +653,84 @@ function onControl(peer, msg) {
     return bindWallet(peer, msg);
   } else if (msg.type === "withdraw") {
     return withdraw(peer, msg);
+  } else if (msg.type === "quote" || msg.type === "swap" || msg.type === "topup") {
+    return trade(peer, msg);
   }
   changed();
+}
+
+// A question: the next turn of a kept conversation, or a new session. When
+// asking is paid, its payment is opened on-chain first, and the session
+// reply carries the query: the answer may run maxTokens tokens.
+async function ask(peer, msg) {
+  let query = null;
+  if (paidAsks() && peer.block) {
+    if (!peer.wallet) return send(peer, { type: "error", requestId: msg.requestId, message: "asking costs PIPER: this phone's wallet isn't linked yet" });
+    if (!msg.payment) return send(peer, { type: "error", requestId: msg.requestId, message: "asking costs PIPER: this question carries no payment" });
+    const empty = blocks.find((b) => !holdersOf(b).length);
+    if (empty) return send(peer, { type: "error", requestId: msg.requestId, message: `waiting for block ${empty.index + 1}: no phone holds it yet` });
+    try {
+      query = await market.openQuery(peer.wallet, msg.payment);
+    } catch (err) {
+      return send(peer, { type: "error", requestId: msg.requestId, message: `payment refused: ${err.shortMessage ?? err.message}` });
+    }
+    log(`${peer.id} pays up to ${fmtPiper(query.maxPayment)} PIPER for ${query.maxTokens} tokens: query ${short(query.id)}, tx ${short(query.hash)}`);
+    send(peer, { type: "query", state: "opened", requestId: msg.requestId, id: query.id, maxTokens: query.maxTokens, maxPayment: query.maxPayment, hash: query.hash });
+    refreshWallet(peer.wallet);
+    if (!peers.has(peer.id)) return settleOpen(query, 0, `${peer.id} left`);
+  }
+
+  const now = Date.now();
+  const old = sessions.get(msg.session);
+  if (old?.asker === peer.id && !old.active) {
+    // The next question of a conversation: same route, its KV caches still there.
+    old.turn++;
+    newTurn(old, now);
+    old.query = query && { ...query, start: old.context, used: 0 };
+    if (old.waitingSince) {
+      old.request = msg.requestId; // its route is still being rebuilt; answered by connect()
+      return changed();
+    }
+    send(peer, { type: "session", requestId: msg.requestId, session: msg.session, route: old.route, attempt: old.attempt, maxTokens: query?.maxTokens });
+    log(`session ${msg.session} turn ${old.turn}: ${peer.id} asks again via ${old.route.join(" → ")}, ${old.context} tokens cached`);
+    return changed();
+  }
+  const empty = blocks.find((b) => !holdersOf(b).length);
+  if (empty) {
+    if (query) settleOpen(query, 0, `no phone holds block ${empty.index + 1}`);
+    return send(peer, { type: "error", requestId: msg.requestId, message: `waiting for block ${empty.index + 1}: no phone holds it yet` });
+  }
+  // Every block has a phone; if some are still loading, the question waits for them.
+  const id = nextSession++;
+  const s = { asker: peer.id, route: [], attempt: 0, reroutes: 0, context: 0, turn: 1, idleSince: 0, request: msg.requestId, waitingSince: now };
+  newTurn(s, now);
+  s.query = query && { ...query, start: 0, used: 0 };
+  sessions.set(id, s);
+  if (!connect(id)) log(`session ${id}: ${peer.id} asks, waiting for phones to load`);
+  changed();
+}
+
+const paidAsks = () => !!market && !opts["free-asks"];
+const fmtPiper = (units) => (Number(units) / 1e18).toFixed(4).replace(/\.?0+$/, "");
+
+// The turn's answer is over (finished, cut, or the session ended): charge the
+// asker for the tokens the swarm ran and refund the rest, once.
+function settleQuery(id, s) {
+  const q = s.query;
+  if (!q) return;
+  s.query = null;
+  settleOpen(q, q.used, `session ${id}`, peers.get(s.asker), id);
+}
+
+function settleOpen(q, used, what, asker = null, session = undefined) {
+  market.settleQuery(q.id, used).then(
+    (r) => {
+      log(`${what}: query ${short(q.id)} settled, ${used} tokens for ${fmtPiper(r.cost)} PIPER, ${fmtPiper(r.refund)} refunded, tx ${short(r.hash)}`);
+      if (asker && peers.has(asker.id)) send(asker, { type: "query", state: "settled", session, id: q.id, tokens: used, cost: r.cost, refund: r.refund, hash: r.hash });
+      if (asker?.wallet) refreshWallet(asker.wallet);
+    },
+    (err) => log(`${what}: settling query ${short(q.id)} failed: ${err.shortMessage ?? err.message}`),
+  );
 }
 
 // The asker's answer finished: save the conversation and this answer's
@@ -652,10 +788,46 @@ const short = (hex) => `${hex.slice(0, 8)}…${hex.slice(-4)}`;
 // --- Rewards ---
 
 // A phone earns from its first token served; until its wallet is known the
-// layer-tokens wait on the connection, then go to the wallet.
-function earn(peer, layerTokens) {
-  if (peer.wallet) rewards.credit(peer.wallet, layerTokens);
-  else peer.unearned += layerTokens;
+// parameter-ops wait on the connection, then go to the wallet.
+function earn(peer, ops) {
+  if (peer.wallet) rewards.credit(peer.wallet, ops);
+  else peer.unearned += ops;
+}
+
+// Trading on the pool, for a phone's wallet: "quote" prices a swap, "swap"
+// submits one the phone signed, "topup" mints it test USDC. The sponsor pays the gas.
+async function trade(peer, msg) {
+  const reply = (body) => send(peer, { type: "walletReply", requestId: msg.requestId, ...body });
+  if (!market) return reply({ error: MARKET_OFF ?? "reading the contracts…" });
+  if (!peer.wallet) return reply({ error: "this phone has no wallet yet" });
+  try {
+    if (msg.type === "quote") return reply({ amountOut: String(await market.quote(msg.side, BigInt(msg.amountIn))) });
+    if (msg.type === "topup") {
+      const hash = await market.usdcFaucet(peer.wallet);
+      log(`${peer.id} topped up 100 test USDC: tx ${short(hash)}`);
+      reply({ hash });
+    } else {
+      const r = await market.swap(peer.wallet, msg);
+      const [inSym, outSym] = msg.side === "buy" ? ["USDC", "PIPER"] : ["PIPER", "USDC"];
+      log(`${peer.id} swapped ${inSym} for ${outSym} on the pool: tx ${short(r.hash)}`);
+      reply(r);
+    }
+  } catch (err) {
+    return reply({ error: err.shortMessage ?? err.message });
+  }
+  await refreshWallet(peer.wallet);
+}
+
+// Rereads a wallet's PIPER and USDC, and tells its phones.
+const usdcBalances = new Map(); // address -> USDC base units, as last read
+async function refreshWallet(address) {
+  await rewards.refresh(address);
+  if (market) {
+    try {
+      usdcBalances.set(address, (await market.balances(address)).usdc);
+    } catch {}
+  }
+  for (const p of peers.values()) if (p.wallet === address) pushWallet(p);
 }
 
 // The phone proves which wallet it holds (src/wallet-auth.js); from then on
@@ -674,8 +846,7 @@ async function bindWallet(peer, msg) {
   peer.unearned = 0;
   if (changedWallet) log(`${peer.id} earns into ${msg.kind === "privy" ? "Privy wallet" : "browser wallet"} ${short(peer.wallet)}`);
   peer.walletSent = null;
-  await rewards.refresh(peer.wallet);
-  pushWallet(peer);
+  await refreshWallet(peer.wallet);
   changed();
 }
 
@@ -693,7 +864,7 @@ async function withdraw(peer, msg) {
 // Sends a phone its wallet's numbers when they change.
 function pushWallet(peer) {
   if (!peer.wallet) return;
-  const msg = JSON.stringify({ type: "wallet", ...rewards.status(peer.wallet) });
+  const msg = JSON.stringify({ type: "wallet", ...rewards.status(peer.wallet), usdc: usdcBalances.get(peer.wallet) ?? null });
   if (msg === peer.walletSent) return;
   peer.walletSent = msg;
   if (peer.ws.readyState === 1) peer.ws.send(msg);
@@ -727,6 +898,21 @@ function onFrame(peer, data) {
   }
   const now = Date.now();
   if (h.hop === 0) {
+    // A paid turn pays for every position past where it started; a replay
+    // after a reroute runs positions already paid for.
+    const q = s.query;
+    if (q) {
+      const used = Math.max(q.used, h.pos + h.n - q.start);
+      if (used > q.maxTokens) {
+        send(peer, { type: "error", session: h.session, message: `the token limit this question paid for (${q.maxTokens}) is used up` });
+        s.active = false;
+        s.idleSince = now;
+        logAnswer(h.session, s, "stopped at its token limit");
+        settleQuery(h.session, s);
+        return changed();
+      }
+      q.used = used;
+    }
     s.context = h.pos + h.n;
   } else {
     const owed = peer.owed.get(h.session);
@@ -740,7 +926,7 @@ function onFrame(peer, data) {
       } else {
         peer.prefillMsPerToken = ewma(peer.prefillMsPerToken, ms / owed.n);
       }
-      earn(peer, owed.n * cost(peer.block));
+      earn(peer, owed.n * params(peer.block));
     }
   }
   const to = peers.get(h.hop < s.route.length ? s.route[h.hop] : s.asker);
@@ -806,12 +992,30 @@ setInterval(() => {
     }
   }
   for (const peer of peers.values()) pushWallet(peer);
-  if (watchers.size) changed(); // pings and silences move even when nothing else does
+  // Pings and silences move even when nothing else does. Phones only hear
+  // it when their summary changes (a holder going quiet, say).
+  changed();
 }, 1000).unref();
 
 rewards.init().then(
   () => setInterval(payoutRound, Number(opts["payout-every"])).unref(),
   (err) => log(`payouts are off: reading the token failed: ${err.shortMessage ?? err.message}`),
+);
+pendingMarket?.init().then(
+  async () => {
+    await pendingMarket.setPrice(PRICE_PER_TOKEN).then(
+      (hash) => hash && log(`market: set the price to ${opts["price-margin"]}× the phones' reward: tx ${hash}`),
+      (err) => log(`setting the market's price failed: ${err.shortMessage ?? err.message}`),
+    );
+    market = pendingMarket;
+    const i = market.info();
+    log(`market: answers cost ${i.tokenPrice} PIPER a token${opts["free-asks"] ? " (asking is free: --free-asks)" : ""}; gas sponsor ${short(i.sponsor)}`);
+    for (const p of peers.values()) if (p.wallet) refreshWallet(p.wallet);
+    // Deposits' cuts wait in the hook until collected.
+    setInterval(() => market.collectFees().catch((err) => log(`collecting the hook's fees failed: ${err.shortMessage ?? err.message}`)),
+      Number(opts["payout-every"])).unref();
+  },
+  (err) => log(`the market is off: reading the contracts failed: ${err.shortMessage ?? err.message}`),
 );
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => {
@@ -874,11 +1078,13 @@ server.listen(Number(opts.port), opts.host, () => {
   for (const url of lanUrls) console.log(`  on the LAN: ${url}`);
   if (opts["public-url"]) console.log(`  for phones: ${opts["public-url"]}`);
   console.log(`  dashboard: ${scheme}://localhost:${port}/dashboard`);
-  console.log(`  management: ${scheme}://localhost:${port}/manage`);
+  console.log(`  management: ${scheme}://localhost:${port}/manage#key=${MANAGE_KEY}`);
   console.log(`  blocks: ${blocks.map(range).join(" ")}, at least ${MIN_REPLICA} phone${MIN_REPLICA > 1 ? "s" : ""} each before splitting`);
   console.log(arkiv ? `  arkiv: saving conversations as ${arkiv.address} on Rabdi, see ${scheme}://localhost:${port}/arkiv` : `  ${ARKIV_OFF}`);
   console.log(`  wallets: ${PRIVY_APP_ID ? `Privy app ${PRIVY_APP_ID}` : "kept in each browser (set PRIVY_APP_ID for Privy guest wallets)"}`);
-  console.log(treasuryKey && tokenAddress
-    ? `  rewards: ${opts.reward} pUSDC per layer-token, paid from the treasury every ${secs(Number(opts["payout-every"]))}, token ${tokenAddress}`
-    : `  rewards: counted in ${opts.ledger}; payouts off: ${PAYOUTS_OFF}`);
+  const terms = `${opts.reward} PIPER per ${Number(opts["reward-params"]).toExponential()} parameter-ops (${REWARD_PER_TOKEN.toFixed(3)} PIPER per token through the whole model)`;
+  console.log(treasuryKey && deployment
+    ? `  rewards: ${terms}, paid from the treasury every ${secs(Number(opts["payout-every"]))}, PIPER ${deployment.piper}`
+    : `  rewards: ${terms}, counted in ${opts.ledger}; payouts off: ${PAYOUTS_OFF}`);
+  if (MARKET_OFF) console.log(`  market: off (${MARKET_OFF}); asking is free`);
 });

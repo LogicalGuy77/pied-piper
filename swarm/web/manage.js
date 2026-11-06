@@ -79,6 +79,74 @@ function render(state) {
     }).join("");
 }
 
+// --- Economy: the chain's side, from /market/status, and the faucet ---
+
+const MANAGE_KEY = new URLSearchParams(location.hash.slice(1)).get("key") ?? "";
+const piper = (units) => (units == null ? "–" : (Number(units) / 1e18).toLocaleString(undefined, { maximumFractionDigits: 3 }));
+const shortHex = (hex) => `${hex.slice(0, 6)}…${hex.slice(-4)}`;
+let explorer = null;
+let walletPhones = ""; // the faucet's options, to rebuild them only when they change
+
+async function readEconomy() {
+  try {
+    const s = await (await fetch("/market/status")).json();
+    if (s.error) throw new Error(s.error);
+    explorer = s.info.explorer;
+    const addr = (a) => `<a class="mono" href="${explorer}/address/${a}" target="_blank" rel="noopener">${shortHex(a)}</a>`;
+    $("economy").innerHTML = [
+      tile(s.price.toPrecision(3), "USDC per PIPER", "on the Uniswap v4 pool"),
+      tile(s.info.tokenPrice, "PIPER per answer token", `market ${addr(s.info.market)}`),
+      tile(Number(s.sponsor.eth).toFixed(4), "sponsor ETH", `pays the gas · ${addr(s.sponsor.address)}`),
+      tile(`${Number(s.sponsor.piper).toFixed(2)} / ${Number(s.sponsor.usdc).toFixed(2)}`, "sponsor PIPER / USDC", `the hook's cut · hook ${addr(s.info.hook)}`),
+      tile(s.treasury ? piper(s.treasury.piper) : "–", "treasury PIPER", "pays rewards, receives question payments"),
+    ].join("");
+  } catch (err) {
+    $("economy").innerHTML = `<div class="muted">${esc(err.message)}</div>`;
+  }
+}
+
+function renderWallets(state) {
+  const phones = state.peers.filter((p) => p.wallet);
+  const options = phones.map((p) => `<option value="${esc(p.id)}">${esc(p.id)} · ${shortHex(p.wallet)}</option>`).join("");
+  if (options !== walletPhones) {
+    const chosen = $("faucet-phone").value;
+    $("faucet-phone").innerHTML = options || "<option value=''>no phone has linked a wallet yet</option>";
+    if (phones.some((p) => p.id === chosen)) $("faucet-phone").value = chosen;
+    walletPhones = options;
+  }
+  const link = (a) => (explorer ? `<a class="mono" href="${explorer}/address/${a}" target="_blank" rel="noopener">${shortHex(a)}</a>` : shortHex(a));
+  $("wallets").innerHTML = `<tr><th>Phone</th><th class="l">Wallet</th><th>Balance PIPER</th><th>Pending</th><th>Paid out</th><th>Parameter-ops</th></tr>`
+    + phones.map((p) => `<tr class="b${p.block % 6}"><td><b>${esc(p.id)}</b></td><td class="l">${link(p.wallet)}</td>
+      <td>${piper(p.earned?.balance)}</td><td>${piper(p.earned?.pending)}</td><td>${piper(p.earned?.paid)}</td>
+      <td>${p.earned ? (p.earned.params / 1e9).toFixed(1) + " B" : "–"}</td></tr>`).join("");
+}
+
+$("faucet").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const button = ev.target.querySelector("button");
+  button.disabled = true;
+  $("faucet-result").textContent = "Sending…";
+  try {
+    const res = await fetch("/manage/faucet", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-manage-key": MANAGE_KEY },
+      body: JSON.stringify({ peer: $("faucet-phone").value, piper: $("faucet-piper").value, usdc: $("faucet-usdc").value }),
+    });
+    const r = await res.json();
+    if (r.error) throw new Error(r.error);
+    $("faucet-result").innerHTML = Object.entries(r)
+      .map(([token, hash]) => `${token.toUpperCase()} sent: <a href="${explorer}/tx/${hash}" target="_blank" rel="noopener">${shortHex(hash)}</a>`).join(" · ");
+    readEconomy();
+  } catch (err) {
+    $("faucet-result").textContent = err.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+readEconomy();
+setInterval(readEconomy, 15000);
+
 function connect() {
   const ws = new WebSocket(location.origin.replace(/^http/, "ws") + "/ws");
   ws.onopen = () => {
@@ -87,7 +155,10 @@ function connect() {
   };
   ws.onmessage = (e) => {
     const msg = JSON.parse(e.data);
-    if (msg.type === "state") render(msg);
+    if (msg.type === "state") {
+      render(msg);
+      renderWallets(msg);
+    }
   };
   ws.onclose = () => {
     $("conn").textContent = "reconnecting…";

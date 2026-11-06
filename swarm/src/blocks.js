@@ -48,6 +48,16 @@ export function costModel(manifest) {
   return (b) => b.end - b.start + (b.end === L ? outputLayers : 0);
 }
 
+// The weights a block multiplies every token by: its layers' tensors, and the
+// output projection on the last block (the embedding is a lookup, not
+// compute). A token through block b is params(b) parameter-ops of work.
+export function paramsModel(manifest) {
+  const { hidden_size: d, vocab_size: vocab, num_layers: L } = manifest.config;
+  const count = (f) => f.tensors.reduce((sum, t) => sum + t.shape.reduce((a, b) => a * b, 1), 0);
+  const perLayer = manifest.layers.map(count);
+  return (b) => perLayer.slice(b.start, b.end).reduce((a, n) => a + n, 0) + (b.end === L ? vocab * d : 0);
+}
+
 // Where to cut a block in two: the layer that splits its compute most evenly,
 // with at least one layer on each side.
 export function splitPoint(b, cost) {

@@ -3,9 +3,10 @@
 // transactions it sent; "On chain" is read back from Arkiv itself, so it shows
 // the database really changed. Used by the phone page and by /arkiv.
 //
-//   const panel = mountArkivPanel(element, { chatId })
+//   const panel = mountArkivPanel(element, { chatId, query })
 //   panel.recorded(event)   // a "recorded" event: refresh now, highlight that entity
 //   panel.setChat(chatId)   // the page started a new chat
+//   panel.lookup(text)      // with query: true, show one conversation by tx hash, entity key or chat id
 //   panel.stop() / panel.start()
 
 const POLL_MS = 5000;
@@ -41,9 +42,43 @@ const STYLE = `
 .ak th:first-child, .ak td:first-child, .ak td.l { text-align: left; }
 .ak .err { color: var(--bad); font-size: 13px; }
 .ak .scroll { overflow-x: auto; }
+.ak form { display: flex; gap: 8px; }
+.ak form input { flex: 1; min-width: 0; font: 13px ui-monospace, monospace; padding: 8px 12px; border: 1px solid var(--line); border-radius: 999px; background: var(--bg); color: inherit; }
+.ak .found { border: 1px solid var(--accent); border-radius: 12px; padding: 10px 12px; margin-top: 8px; display: grid; gap: 6px; }
+.ak .m.later, .ak tr.later { opacity: .45; }
+.ak .cut { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; padding: 2px 0; }
+.ak button.q { font: inherit; background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; text-decoration: underline dotted; }
 `;
 
-export function mountArkivPanel(root, { chatId = null } = {}) {
+// One conversation: its messages and per-answer metrics. savedAtTx: the
+// answers a looked-up transaction saved; later ones are dimmed.
+function entityHtml(e, { open = false, badges = "", savedAtTx = null } = {}) {
+  const updated = e.updatedAtBlock !== e.createdAtBlock;
+  let answers = 0, cutShown = false;
+  const msgs = e.messages.map((m) => {
+    const later = savedAtTx != null && answers >= savedAtTx;
+    if (m.role === "assistant") answers++;
+    const cut = later && !cutShown ? `<div class="cut">Added after this transaction</div>` : "";
+    if (later) cutShown = true;
+    return `${cut}<div class="m${later ? " later" : ""}"><b>${esc(m.role)}:</b> ${esc(m.content)}</div>`;
+  }).join("");
+  return `<details class="ent" data-key="${esc(e.key)}"${open ? " open" : ""}>
+    <summary><b>chat ${esc(e.chatId.slice(0, 8))}</b>${badges}
+      <span>${e.turns} turn${e.turns === 1 ? "" : "s"} · ${e.tokens} tokens · ${esc(e.model)}</span>
+      <span class="meta">${updated ? `updated at block ${e.updatedAtBlock.toLocaleString()}` : `added at block ${e.createdAtBlock.toLocaleString()}`} · ${ago(e.updatedMs)} · ${left(e.expiresInSec)}</span>
+      <span class="meta">entity <button class="q" data-q="${esc(e.key)}">${esc(short(e.key))}</button> (${ext(e.url, "explorer")})</span></summary>
+    <div class="meta">chat id <code>${esc(e.chatId)}</code>${e.owner && e.mine === false ? ` · written by ${esc(short(e.owner))}, not this tracker` : ""}</div>
+    <div class="msgs">${msgs}</div>
+    <div class="scroll"><table><tr><th>turn</th><th>at</th><th>prompt</th><th>tokens</th><th>first token</th><th>ms/token</th><th>tok/s</th><th>route</th><th>per hop ms</th><th>finish</th></tr>
+    ${e.metrics.map((m) => `<tr${savedAtTx != null && m.turn > savedAtTx ? ` class="later"` : ""}><td>${m.turn}</td><td class="l">${esc(m.at ? new Date(m.at).toLocaleTimeString() : "")}</td><td>${m.promptTokens ?? ""}</td><td>${m.tokens}</td>`
+      + `<td>${m.firstTokenMs != null ? (m.firstTokenMs / 1000).toFixed(1) + " s" : ""}</td><td>${m.msPerToken ?? ""}</td><td>${m.tokensPerSec ?? ""}</td>`
+      + `<td class="l">${esc((m.route ?? []).join(" → "))}${m.reroutes ? ` (${m.reroutes}× rerouted)` : ""}</td><td class="l">${esc((m.hopMs ?? []).join(" · "))}</td><td class="l">${esc(m.finish)}</td></tr>`).join("")}
+    </table></div></details>`;
+}
+
+const OPS = { EntityCreated: "added the conversation", EntityPatched: "updated it", ExpiryExtended: "kept it a day longer" };
+
+export function mountArkivPanel(root, { chatId = null, query = false } = {}) {
   if (!document.getElementById("ak-style")) {
     const style = document.createElement("style");
     style.id = "ak-style";
@@ -51,9 +86,13 @@ export function mountArkivPanel(root, { chatId = null } = {}) {
     document.head.append(style);
   }
   root.innerHTML = `<div class="ak"><div class="meta" data-k="info">Loading…</div>
+    ${query ? `<div><h3>Look up a conversation</h3>
+      <form data-k="form"><input data-k="q" placeholder="transaction hash, entity key or chat id" autocomplete="off" spellcheck="false"><button class="quiet">Look up</button></form>
+      <div data-k="found"></div></div>` : ""}
     <div><div class="head"><h3>Latest writes (sent by the tracker)</h3><button class="quiet" data-k="refresh">Refresh</button></div><div data-k="writes"></div></div>
     <div><h3>On chain (read back from Arkiv)</h3><div class="meta" data-k="read"></div><div data-k="entities"></div></div></div>`;
   const $ = (k) => root.querySelector(`[data-k="${k}"]`);
+  const hash = (h, text = short(h)) => (query ? `<button class="q" data-q="${esc(h)}">${esc(text)}</button>` : esc(text));
 
   let timer = null;
   let loading = false;
@@ -92,14 +131,14 @@ export function mountArkivPanel(root, { chatId = null } = {}) {
       ? info.writes.slice(0, 10).map((w) => `<div class="row"><span>${time(w.at)}</span>`
         + `<span class="op ${w.op}">${w.op === "create" ? "ADD" : "UPDATE"}</span>`
         + `<span>chat ${esc(w.chatId.slice(0, 8))}${w.chatId === chatId ? " (this chat)" : ""}</span>`
-        + `<span>turn ${w.turns}</span><span>entity ${ext(w.entityUrl, short(w.entityKey))}</span>`
-        + `<span>tx ${ext(w.txUrl, short(w.txHash))}</span></div>`).join("")
+        + `<span>turn ${w.turns}</span><span>entity ${hash(w.entityKey)} (${ext(w.entityUrl, "explorer")})</span>`
+        + `<span>tx ${hash(w.txHash)} (${ext(w.txUrl, "explorer")})</span></div>`).join("")
       : `<div class="meta">Nothing yet. Ask a question: when the answer ends, it is saved here.</div>`;
   }
 
   function renderEntities(list) {
     $("read").textContent = `Read at ${time(list.readAt)}, block ${list.currentBlock.toLocaleString()} · ${list.entities.length} conversation${list.entities.length === 1 ? "" : "s"}`;
-    for (const d of root.querySelectorAll("details[data-key]")) (d.open ? open.add(d.dataset.key) : open.delete(d.dataset.key));
+    for (const d of $("entities").querySelectorAll("details[data-key]")) (d.open ? open.add(d.dataset.key) : open.delete(d.dataset.key));
     const changed = new Set();
     for (const e of list.entities) {
       const before = seen.get(e.key);
@@ -109,30 +148,68 @@ export function mountArkivPanel(root, { chatId = null } = {}) {
     flashKey = null;
     $("entities").innerHTML = list.entities.map((e) => {
       const mine = e.chatId === chatId;
-      const updated = e.updatedAtBlock !== e.createdAtBlock;
-      return `<details class="ent${mine ? " mine" : ""}" data-key="${esc(e.key)}"${open.has(e.key) || (mine && changed.has(e.key)) ? " open" : ""}>
-        <summary><b>chat ${esc(e.chatId.slice(0, 8))}</b>${mine ? `<span class="badge">THIS CHAT</span>` : ""}
-          ${changed.has(e.key) ? `<span class="badge">JUST UPDATED</span>` : ""}
-          <span>${e.turns} turn${e.turns === 1 ? "" : "s"} · ${e.tokens} tokens</span>
-          <span class="meta">${updated ? `updated at block ${e.updatedAtBlock.toLocaleString()}` : `added at block ${e.createdAtBlock.toLocaleString()}`} · ${ago(e.updatedMs)} · ${left(e.expiresInSec)}</span>
-          <span class="meta">entity ${ext(e.url, short(e.key))}</span></summary>
-        <div class="msgs">${e.messages.map((m) => `<div class="m"><b>${esc(m.role)}:</b> ${esc(m.content)}</div>`).join("")}</div>
-        <div class="scroll"><table><tr><th>turn</th><th>at</th><th>prompt</th><th>tokens</th><th>first token</th><th>ms/token</th><th>tok/s</th><th>route</th><th>per hop ms</th><th>finish</th></tr>
-        ${e.metrics.map((m) => `<tr><td>${m.turn}</td><td class="l">${esc(m.at ? new Date(m.at).toLocaleTimeString() : "")}</td><td>${m.promptTokens ?? ""}</td><td>${m.tokens}</td>`
-          + `<td>${m.firstTokenMs != null ? (m.firstTokenMs / 1000).toFixed(1) + " s" : ""}</td><td>${m.msPerToken ?? ""}</td><td>${m.tokensPerSec ?? ""}</td>`
-          + `<td class="l">${esc((m.route ?? []).join(" → "))}${m.reroutes ? ` (${m.reroutes}× rerouted)` : ""}</td><td class="l">${esc((m.hopMs ?? []).join(" · "))}</td><td class="l">${esc(m.finish)}</td></tr>`).join("")}
-        </table></div></details>`;
+      const badges = (mine ? `<span class="badge">THIS CHAT</span>` : "") + (changed.has(e.key) ? `<span class="badge">JUST UPDATED</span>` : "");
+      return entityHtml(e, { open: open.has(e.key) || (mine && changed.has(e.key)), badges }).replace(`class="ent"`, `class="ent${mine ? " mine" : ""}"`);
     }).join("") || `<div class="meta">No conversations from this wallet on chain yet (or they all expired).</div>`;
     for (const key of changed) {
-      const el = root.querySelector(`details[data-key="${CSS.escape(key)}"]`);
+      const el = $("entities").querySelector(`details[data-key="${CSS.escape(key)}"]`);
       el?.classList.add("flash");
       setTimeout(() => el?.classList.remove("flash"), 1500);
     }
   }
 
+  async function lookup(text) {
+    text = String(text ?? "").trim();
+    if (!query || !text) return;
+    $("q").value = text;
+    history.replaceState(null, "", `#q=${encodeURIComponent(text)}`);
+    $("found").innerHTML = `<div class="meta">Reading from Arkiv…</div>`;
+    try {
+      const res = await fetch(`/arkiv/lookup?q=${encodeURIComponent(text)}`);
+      const r = await res.json();
+      if (!res.ok) throw new Error(r.error);
+      renderFound(r);
+    } catch (err) {
+      $("found").innerHTML = `<div class="err">${esc(err.message)}</div>`;
+    }
+  }
+
+  function renderFound(r) {
+    const tx = r.tx;
+    const head = tx
+      ? `<div class="row"><span>tx ${ext(tx.url, short(tx.hash))}</span><span>block ${tx.block.toLocaleString()}</span><span>${new Date(tx.timeMs).toLocaleString()}</span>`
+        + `<span>from ${esc(short(tx.from))}</span><span>${tx.status === "success" ? esc(tx.ops.map((o) => OPS[o] ?? o).join(", ") || "no entity changes") : "<span class=\"err\">reverted</span>"}</span></div>`
+      : "";
+    const e = r.entities;
+    const saved = (x) => (x.savedAtTx != null
+      ? `<div class="meta">This transaction saved the first ${x.savedAtTx} answer${x.savedAtTx === 1 ? "" : "s"}${x.savedAtTx < x.turns ? `; the ${x.turns - x.savedAtTx} after it are dimmed` : ""}. Arkiv keeps only the latest version, so this is the conversation as it is now.</div>`
+      : "");
+    const body = e.length
+      ? e.map((x) => saved(x) + entityHtml(x, { open: e.length === 1, savedAtTx: x.savedAtTx ?? null })).join("")
+      : "";
+    const count = r.kind === "chat" && e.length ? `<div class="meta">${e.length} conversation${e.length === 1 ? "" : "s"} whose chat id starts with <code>${esc(r.query)}</code></div>` : "";
+    $("found").innerHTML = `<div class="found">${head}${count}${r.note ? `<div class="meta">${esc(r.note[0].toUpperCase() + r.note.slice(1))}.</div>` : ""}${body}</div>`;
+  }
+
   $("refresh").addEventListener("click", refresh);
+  if (query) {
+    $("form").addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      lookup($("q").value);
+    });
+    root.addEventListener("click", (ev) => {
+      const b = ev.target.closest("button.q");
+      if (!b) return;
+      ev.preventDefault();
+      lookup(b.dataset.q);
+      $("q").scrollIntoView({ block: "center", behavior: "smooth" });
+    });
+    const initial = new URLSearchParams(location.hash.slice(1)).get("q");
+    if (initial) lookup(initial);
+  }
 
   const panel = {
+    lookup,
     start() {
       if (timer) return;
       refresh();

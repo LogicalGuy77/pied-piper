@@ -240,9 +240,10 @@ const conversation = { ids: [], answers: [] };
 // few seconds. (A browser answers pings outside the page's JS.)
 const HEARTBEAT_MS = 8000;
 // The rewards ledger goes to a scratch file: the checks never touch the real one.
+// No deployment either, so nothing is paid on-chain and asking is free.
 const tracker = spawn(process.execPath, [join(ROOT, "swarm", "tracker.js"), "--port", "0", "--host", "127.0.0.1", "--weights", WEIGHTS,
   "--heartbeat-timeout", String(HEARTBEAT_MS), "--ledger", join(tmpdir(), `swarm-check-rewards-${process.pid}.json`)],
-  { stdio: ["ignore", "pipe", "inherit"] });
+  { stdio: ["ignore", "pipe", "inherit"], env: { ...process.env, PIPER_DEPLOYMENT: join(tmpdir(), "no-deployment.json") } });
 const trackerLog = [];
 const server = await new Promise((resolve, reject) => {
   tracker.on("exit", (code) => reject(new Error(`tracker exited with ${code}`)));
@@ -519,10 +520,18 @@ console.log("13. Silent phones: busy versus frozen");
   other.close();
   phones.splice(phones.indexOf(other), 1);
   await until(() => !listed(other.id));
-  const steps = await collect(asker.ask(prompt, { maxNew: 3, stopIds: [EOS] }));
+  // While it sits on the frame, the dashboard and every phone should see
+  // its block in danger: a ready holder not answering.
+  const asking = collect(asker.ask(prompt, { maxNew: 3, stopIds: [EOS] }));
+  const onDashboard = await until(() => watch.state.peers.find((p) => p.id === welcome.id)?.silentMs > HEARTBEAT_MS, SILENT_MS + 2000);
+  const onPhones = await until(() => phones.every((p) => swarmState.get(p.id)?.holders[welcome.block.index]?.silent === 1), 3000);
+  const steps = await asking;
   check("a phone silent for longer than the heartbeat timeout while it owes a reply is kept",
     steps[0].route.includes(welcome.id) && same(steps.map((x) => x.token), greedy.slice(0, 3)) && listed(welcome.id),
     `${welcome.id} on block ${welcome.block.index + 1}, silent ${(SILENT_MS / 1000).toFixed(0)} s, first token ${(steps[0].ms / 1000).toFixed(1)} s`);
+  const cleared = await until(() => phones.every((p) => swarmState.get(p.id)?.holders[welcome.block.index]?.silent === 0), 3000);
+  check("meanwhile the dashboard and every phone see that block's holder as not answering, then answering again",
+    onDashboard && onPhones && cleared, `${onDashboard ? "dashboard" : "not the dashboard"}, ${onPhones ? "phones" : "not the phones"}, ${cleared ? "cleared" : "not cleared"}`);
   const t = performance.now();
   const dropped = await until(() => !listed(welcome.id), 15000);
   check("once idle and still silent, it is dropped", dropped,

@@ -144,20 +144,36 @@ export class Peer {
   // answer finishes: messages is the chat up to this question, and the
   // tracker adds the answer's metrics and writes it (it holds the wallet).
   // Needs loadTokenizer(), to turn the answer back into text.
-  async *ask(promptIds, { maxNew = 256, stopIds = [2], keep = false, record = null } = {}) {
+  //
+  // payment: the signed PIPER payment for this question, when asking is paid
+  // (src/market.js). The tracker opens it on-chain and answers with the
+  // token limit it pays for: the prompt's new tokens and the answer together.
+  // The answer stops there (finish "limit") if the stop token hasn't come.
+  async *ask(promptIds, { maxNew = 256, stopIds = [2], keep = false, record = null, payment = null } = {}) {
     const ids = Array.from(promptIds);
     const prev = this.chat;
     this.chat = null;
     const cached = prev && !prev.error && ids.length > prev.fed && startsWith(ids, prev.history, prev.fed) ? prev : null;
     if (prev && !cached) this.endSession(prev.session);
+    const paidFrom = cached?.fed ?? 0; // where the tracker starts charging this turn
     let reply;
     try {
-      reply = await this.request({ type: "ask", session: cached?.session });
+      reply = await this.request({ type: "ask", session: cached?.session, ...(payment && { payment }) });
     } catch (err) {
       if (cached) this.endSession(cached.session);
       throw err;
     }
     const { session, route, attempt } = reply;
+    // Generating n tokens runs the new prompt tokens, then n - 1 answer tokens fed back.
+    let limit = Infinity;
+    if (reply.maxTokens != null) {
+      limit = reply.maxTokens - (ids.length - paidFrom) + 1;
+      if (limit < 1) {
+        this.endSession(session);
+        throw new Error(`what you'd pay covers ${reply.maxTokens} tokens, and the question is ${ids.length - paidFrom}: raise the most you'd pay`);
+      }
+    }
+    const steps = Math.min(maxNew, limit);
     let q;
     if (cached && session === cached.session) {
       if (attempt !== cached.attempt) cached.fed = 0; // rerouted while idle: the new route has seen nothing
@@ -172,7 +188,7 @@ export class Peer {
     const answer = [];
     const timing = { firstMs: 0, restMs: 0 };
     try {
-      for (let i = 0; i < maxNew; i++) {
+      for (let i = 0; i < steps; i++) {
         const t0 = performance.now();
         const token = await new Promise((resolve, reject) => {
           if (q.error) return reject(q.error);
@@ -182,11 +198,11 @@ export class Peer {
         const ms = performance.now() - t0;
         if (i === 0) timing.firstMs = ms;
         else timing.restMs += ms;
-        const finish = stop.has(token) ? "stop" : i === maxNew - 1 ? "length" : null;
+        const finish = stop.has(token) ? "stop" : i === steps - 1 ? (steps < maxNew ? "limit" : "length") : null;
         if (!stop.has(token)) answer.push(token);
         // The answer is complete: save it now, before the session ends or goes idle.
-        if (finish && record) this.record(session, record, answer, finish, timing);
-        yield { token, session, route: q.route, reroutes: q.reroutes, cached: already, ms };
+        if (finish && record) this.record(session, record, answer, finish === "stop" ? "stop" : "length", timing);
+        yield { token, session, route: q.route, reroutes: q.reroutes, cached: already, ms, finish };
         if (finish === "stop") break;
         q.history.push(token);
       }
@@ -253,10 +269,12 @@ export class Peer {
 
   // Wallet messages from the page to the tracker: "wallet" links the wallet
   // this phone earns into, "withdraw" sends its tokens out (src/wallet-auth.js,
-  // src/rewards.js). The answers arrive as "wallet" and "withdrawn" events.
+  // src/rewards.js); "quote", "swap" and "topup" trade on the pool
+  // (src/market.js). The answers arrive as "wallet", "withdrawn" and
+  // "walletReply" events.
   sendWallet(msg) {
     if (this.ws?.readyState !== WebSocket.OPEN) return false;
-    if (msg.type !== "wallet" && msg.type !== "withdraw") return false;
+    if (!["wallet", "withdraw", "quote", "swap", "topup"].includes(msg.type)) return false;
     this.send(msg);
     return true;
   }
@@ -314,7 +332,7 @@ export class Peer {
       this.drop(msg.session, msg.attempt);
     } else if (msg.type === "assign") {
       this.reassign(msg.block);
-    } else if (msg.type === "swarm" || msg.type === "recorded" || msg.type === "wallet" || msg.type === "withdrawn") {
+    } else if (["swarm", "recorded", "wallet", "withdrawn", "walletReply", "query"].includes(msg.type)) {
       this.onEvent(msg);
     }
   }

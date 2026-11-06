@@ -78,18 +78,20 @@ async function start(server) {
 let conversation = null;
 
 // messages is the same conversation as text, up to this question, for Arkiv.
-async function ask(text, messages, maxNew, chatId) {
+// payment: the signed PIPER payment, when asking is paid.
+async function ask(text, messages, maxNew, chatId, payment) {
   const tok = peer.tokenizer;
   const ids = conversation ? [...conversation, ...tok.encode(tok.turnText(text))] : tok.chat([{ role: "user", content: text }]);
   const decoder = tok.streamDecoder();
   const answer = [];
-  let firstMs = 0, restMs = 0, reroutes = 0, cached = 0;
+  let firstMs = 0, restMs = 0, reroutes = 0, cached = 0, finish = null;
   try {
     const record = chatId ? { chatId, messages } : null;
-    for await (const step of peer.ask(ids, { maxNew, stopIds: tok.stopIds, keep: true, record })) {
+    for await (const step of peer.ask(ids, { maxNew, stopIds: tok.stopIds, keep: true, record, payment })) {
       answer.push(step.token);
       reroutes = step.reroutes;
       cached = step.cached;
+      finish = step.finish;
       if (answer.length === 1) firstMs = step.ms;
       else restMs += step.ms;
       post({ type: "token", text: decoder.push(step.token), route: step.route, session: step.session });
@@ -99,7 +101,7 @@ async function ask(text, messages, maxNew, chatId) {
     // conversation ends the turn with <|im_end|> whatever token stopped it.
     conversation = [...ids, ...(tok.stopIds.includes(answer.at(-1)) ? answer.slice(0, -1) : answer), tok.eosId];
     const tokens = answer.length;
-    post({ type: "done", tokens, firstMs, msPerToken: tokens > 1 ? restMs / (tokens - 1) : 0, reroutes, cached, prompt: ids.length });
+    post({ type: "done", tokens, firstMs, msPerToken: tokens > 1 ? restMs / (tokens - 1) : 0, reroutes, cached, prompt: ids.length, finish });
   } catch (err) {
     post({ type: "error", message: err.message }); // the conversation stays as it was before this question
   }
@@ -112,7 +114,7 @@ function newChat() {
 
 self.onmessage = ({ data }) => {
   if (data.type === "start") start(data.server);
-  else if (data.type === "ask") ask(data.text, data.messages, data.maxNew, data.chatId);
+  else if (data.type === "ask") ask(data.text, data.messages, data.maxNew, data.chatId, data.payment);
   else if (data.type === "new-chat") newChat();
   else if (data.type === "stats") peer?.report(data.stats);
   else if (data.type === "to-tracker") peer?.sendWallet(data.msg);

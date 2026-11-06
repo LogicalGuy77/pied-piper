@@ -1,0 +1,24 @@
+{
+  "chainId": 11155111,
+  "treasury": "0x6Df25c36597231E7784E10A051850B63D2084461",
+  "sponsor": "0xed2194676b3a574fb2C0D998C994AcEA9D61e51d",
+  "piper": "0xDd4bb93084D482eBf59459492906ed63d61Da168",
+  "usdc": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+  "testUsdc": false,
+  "market": "0xD53390cB10Ef4b0e3F157A854AD84F01F161A596",
+  "poolManager": "0xE03A1074c86CFeDd5C142C4F04F1a1536e203543",
+  "hook": "0xafd5b3eCd1d4448f4878076e92065E77dA970446",
+  "router": "0x5Bf925A981A46b1A2DaE24E273F3B1C1b9Fe1900",
+  "pool": {
+    "currency0": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+    "currency1": "0xDd4bb93084D482eBf59459492906ed63d61Da168",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "hooks": "0xafd5b3eCd1d4448f4878076e92065E77dA970446",
+    "price": "0.01",
+    "sqrtPriceX96": "792281625142643375935439503360000000",
+    "liquidity": "99000000000000"
+  },
+  "tokenPrice": "0.2",
+  "block": 12078330
+}

@@ -163,7 +163,11 @@ nothing for 5 s, not even a pong, is dropped (`--heartbeat-timeout`). A
 locked phone keeps its connection open, so waiting for a close event alone
 would hang the asker forever. A phone that owes a reply gets 20 s instead
 (`--busy-timeout`): a long prefill is not a phone gone. The cost is that a
-phone freezing mid-computation takes up to 20 s to notice.
+phone freezing mid-computation takes up to 20 s to drop. It is visible
+before that: once a ready phone has been quiet past the heartbeat timeout,
+its block turns red on the dashboard ("not answering for N s: dropped at
+20 s unless it replies") and on every phone page, and the phones' summary
+counts it as not answering.
 
 **Staying awake.** The page holds a screen wake lock while it is visible and
 takes it again when the phone comes back to it. A phone that switches apps

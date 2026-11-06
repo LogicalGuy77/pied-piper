@@ -1,27 +1,28 @@
-// What phones earn for the blocks they serve, and paying it out in PIPER USDC
-// (pUSDC, 6 decimals) on Unichain Sepolia (chain/PiedPiperToken.sol).
+// What phones earn for the compute they lend, paid in PIPER on Sepolia
+// (chain/PiedPiperToken.sol).
 //
-// Earnings are counted in layer-tokens: a phone that runs n tokens through a
-// block of c layer-equivalents (blocks.js costModel) does n * c of them. They
-// go to the phone's wallet address as pending, in the token's base units; the
-// fraction of a unit left over is carried to the next credit, so tiny
-// rewards add up exactly. Every payout round, the treasury sends everything
-// pending above the minimum in one transferMany transaction. The ledger lives
-// in a JSON file, so a restart loses nothing.
+// Earnings are counted in parameter-ops: a phone that runs n tokens through
+// a block of p parameters (blocks.js paramsModel) did n * p of them, and earns
+// rewardPerUnit PIPER for every unitParams of them. They go to the phone's
+// wallet address as pending, in base units; what is left over below a unit is
+// carried to the next credit, so nothing is lost to rounding. Every payout
+// round, the treasury sends everything pending above the minimum in one
+// transferMany transaction. The ledger lives in a JSON file, so a restart
+// loses nothing.
 //
 // A round's transaction is written to the ledger before it is waited on.
 // Until it is settled, no other round starts; after a crash it is looked up
 // again, so a round is never paid twice.
 //
-// Withdrawing: the phone's wallet holds pUSDC but no ETH, so it signs an
-// ERC-3009 TransferWithAuthorization to its own destination, and the
-// treasury submits it and pays the gas.
+// Withdrawing: the phone's wallet holds PIPER but no ETH, so it signs an
+// ERC-3009 TransferWithAuthorization to its own destination, and the gas
+// sponsor (or else the treasury) submits it and pays the gas.
 
-import { readFileSync, renameSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { createPublicClient, createWalletClient, formatUnits, getAddress, http, isAddress, isHex, parseAbi, parseUnits } from "viem";
+import { createPublicClient, createWalletClient, formatUnits, getAddress, http, isAddress, isHex, nonceManager, parseAbi, parseUnits } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { unichainSepolia } from "viem/chains";
+import { CHAIN } from "./chain.js";
 
 export const TOKEN_ABI = parseAbi([
   "function name() view returns (string)",
@@ -45,34 +46,36 @@ const WITHDRAW_ERRORS = {
   AuthorizationExpired: "the signature expired; withdraw again",
   AuthorizationNotYetValid: "the signature isn't valid yet",
   InvalidAuthorizationSignature: "the signature doesn't match this withdrawal",
-  ERC20InsufficientBalance: "not that much pUSDC in this wallet",
+  ERC20InsufficientBalance: "not that much PIPER in this wallet",
 };
 
-const PER_ROUND = 200;          // recipients per transferMany
-const SCALE = 1_000_000n;       // layer-tokens are fractional; count them in millionths
+const PER_ROUND = 200; // recipients per transferMany
 
-// chain: { privateKey, rpcUrl, token } to pay out, or null to only count.
-// decimals: the token's; the ledger counts in its base units.
-// withdrawEvery: ms a wallet waits between withdrawals, since the treasury pays their gas.
+// chain: { privateKey, relayerKey?, rpcUrl, token } to pay out, or null to
+// only count. privateKey is the treasury's; relayerKey the gas sponsor's.
+// withdrawEvery: ms a wallet waits between withdrawals, since someone else pays their gas.
 export function createRewards({
-  file, rewardPerLayerToken = "0.000001", payoutMin = "0.01", decimals = 6, chain = null, withdrawEvery = 30000, log = console.log,
+  file, rewardPerUnit = "1", unitParams = 1e9, payoutMin = "1", decimals = 18, chain = null, withdrawEvery = 30000, log = console.log,
 }) {
-  const reward = parseUnits(rewardPerLayerToken, decimals);
+  const reward = parseUnits(rewardPerUnit, decimals);
+  const unit = BigInt(unitParams);
   const min = parseUnits(payoutMin, decimals);
-  const ledger = load(file, decimals);
+  const ledger = load(file, { decimals, rate: `${rewardPerUnit}/${unitParams}` }, log);
   const balances = new Map(); // address -> on-chain balance, as last read
   const lastWithdraw = new Map();
   let token = null;           // { address, name, symbol, decimals, version, chainId }
   let paying = false;
   let saveTimer = null;
 
-  const account = chain ? privateKeyToAccount(chain.privateKey) : null;
+  const account = chain ? privateKeyToAccount(chain.privateKey, { nonceManager }) : null;
+  const relayer = chain?.relayerKey ? privateKeyToAccount(chain.relayerKey, { nonceManager }) : account;
   const transport = chain ? http(chain.rpcUrl) : null;
-  const pub = chain ? createPublicClient({ chain: unichainSepolia, transport }) : null;
-  const wallet = chain ? createWalletClient({ account, chain: unichainSepolia, transport }) : null;
+  const pub = chain ? createPublicClient({ chain: CHAIN, transport }) : null;
+  const wallet = chain ? createWalletClient({ account, chain: CHAIN, transport }) : null;
+  const relay = chain ? createWalletClient({ account: relayer, chain: CHAIN, transport }) : null;
 
-  // carry: millionths of a base unit earned but not yet a whole unit.
-  const entry = (address) => (ledger.accounts[address] ??= { pending: "0", paid: "0", carry: "0", layerTokens: 0 });
+  // carry: parameter-ops times the reward, below one base unit's worth.
+  const entry = (address) => (ledger.accounts[address] ??= { pending: "0", paid: "0", carry: "0", params: 0 });
 
   function save(now = false) {
     clearTimeout(saveTimer);
@@ -99,19 +102,20 @@ export function createRewards({
     if (ledger.inflight) await settle();
   }
 
-  function credit(address, layerTokens) {
-    if (!(layerTokens > 0)) return;
+  // params: parameter-ops, a whole number.
+  function credit(address, params) {
+    if (!(params > 0)) return;
     const e = entry(address);
-    const owed = BigInt(e.carry ?? "0") + BigInt(Math.round(layerTokens * Number(SCALE))) * reward;
-    e.pending = String(BigInt(e.pending) + owed / SCALE);
-    e.carry = String(owed % SCALE);
-    e.layerTokens += layerTokens;
+    const owed = BigInt(e.carry) + BigInt(Math.round(params)) * reward;
+    e.pending = String(BigInt(e.pending) + owed / unit);
+    e.carry = String(owed % unit);
+    e.params += Math.round(params);
     save();
   }
 
   function status(address) {
-    const e = ledger.accounts[address] ?? { pending: "0", paid: "0", layerTokens: 0 };
-    return { address, pending: e.pending, paid: e.paid, balance: balances.get(address) ?? null, layerTokens: Math.round(e.layerTokens) };
+    const e = ledger.accounts[address] ?? { pending: "0", paid: "0", params: 0 };
+    return { address, pending: e.pending, paid: e.paid, balance: balances.get(address) ?? null, params: e.params };
   }
 
   async function refresh(address) {
@@ -197,12 +201,12 @@ export function createRewards({
     const args = [owner, getAddress(w.to), value, BigInt(w.validAfter), BigInt(w.validBefore), w.nonce, w.signature];
     let request;
     try {
-      ({ request } = await pub.simulateContract({ account, address: token.address, abi: TOKEN_ABI, functionName: "transferWithAuthorization", args }));
+      ({ request } = await pub.simulateContract({ account: relayer, address: token.address, abi: TOKEN_ABI, functionName: "transferWithAuthorization", args }));
     } catch (err) {
       const reason = WITHDRAW_ERRORS[err.walk?.((e) => e.data?.errorName)?.data.errorName];
       throw reason ? new Error(reason) : err;
     }
-    const hash = await wallet.writeContract(request);
+    const hash = await relay.writeContract(request);
     const receipt = await pub.waitForTransactionReceipt({ hash });
     if (receipt.status !== "success") throw new Error(`withdraw transaction ${hash} reverted`);
     log(`${owner} withdrew ${fmt(value)} ${token.symbol} to ${args[1]}: tx ${hash}`);
@@ -217,8 +221,9 @@ export function createRewards({
       payouts: !!token,
       token,
       treasury: account?.address ?? null,
-      explorer: unichainSepolia.blockExplorers.default.url,
-      rewardPerLayerToken,
+      explorer: CHAIN.blockExplorers.default.url,
+      rewardPerUnit,
+      unitParams,
       payoutMin,
     };
   }
@@ -226,17 +231,23 @@ export function createRewards({
   return { init, credit, status, refresh, payout, withdraw, info, flush: () => save(true) };
 }
 
-// A ledger kept in other units (the 18-decimal PIPER) is refused, not misread.
-function load(file, decimals) {
+// A ledger kept in other units (the old 6-decimal pUSDC, or counted per
+// layer) is moved aside, not misread; its numbers were never on-chain money.
+function load(file, terms, log) {
   let ledger;
   try {
     ledger = JSON.parse(readFileSync(file, "utf8"));
   } catch (err) {
     if (err.code !== "ENOENT") throw new Error(`cannot read the rewards ledger ${file}: ${err.message}`);
-    return { decimals, accounts: {}, inflight: null };
+    return { ...terms, accounts: {}, inflight: null };
   }
-  if ((ledger.decimals ?? 18) !== decimals) {
-    throw new Error(`the rewards ledger ${file} counts in ${ledger.decimals ?? 18} decimals, not ${decimals}; move it away to start a new one`);
+  if (ledger.decimals !== terms.decimals || ledger.rate !== terms.rate) {
+    if (ledger.inflight) throw new Error(`the rewards ledger ${file} has a payout in flight under other terms; settle it first`);
+    let old = `${file}.old`;
+    for (let i = 2; existsSync(old); i++) old = `${file}.old${i}`;
+    renameSync(file, old);
+    log(`the rewards ledger ${file} counted ${ledger.rate ?? "per layer"} in ${ledger.decimals ?? 18} decimals; moved it to ${old} and started a new one`);
+    return { ...terms, accounts: {}, inflight: null };
   }
-  return { decimals, accounts: ledger.accounts ?? {}, inflight: ledger.inflight ?? null };
+  return { ...terms, accounts: ledger.accounts ?? {}, inflight: ledger.inflight ?? null };
 }

@@ -125,6 +125,8 @@
     .card-head .grow { flex: 1; }
     .map { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
     .blk { border-radius: 14px; border: 1px solid var(--line); background: var(--page); padding: 12px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+    /* A holder has stopped answering past the heartbeat timeout: the block is in danger. */
+    .blk.alarm { border-color: var(--red); box-shadow: 0 0 0 2px var(--red-soft); }
     .blk-head { display: flex; align-items: center; gap: 8px; }
     .blk-head i { width: 10px; height: 10px; border-radius: 4px; flex: none; }
     .blk-head b { font-size: 13.5px; font-weight: 600; }

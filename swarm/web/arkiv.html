@@ -26,13 +26,13 @@
       <h1>Open database on Arkiv</h1>
       <span class="muted" style="font-size:13px"><a href="index.html">Phone</a> · <a href="dashboard.html">Dashboard</a> · <a href="manage.html">Management</a></span>
     </div>
-    <div class="muted">Every finished answer saves its conversation and metrics to Arkiv's Rabdi testnet. Anyone can read these entities; only the tracker's wallet can change them.</div>
+    <div class="muted">Every finished answer saves its conversation and metrics to Arkiv's Rabdi testnet. Anyone can read these entities; only the tracker's wallet can change them. Look one up below by the transaction that wrote it, its entity key or its chat id; no explorer needed.</div>
   </section>
   <section class="card" id="panel"></section>
 </main>
 <script type="module">
   import { mountArkivPanel } from "./arkiv.js";
-  mountArkivPanel(document.getElementById("panel"));
+  mountArkivPanel(document.getElementById("panel"), { query: true });
 </script>
 </body>
 </html>
