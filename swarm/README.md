@@ -102,10 +102,13 @@ the reference answer through A → B → C.
 | `src/blocks.js` | Where phones go: the first cut, joins, splits and repairs, as pure functions |
 | `src/tokenizer.js` | Byte-level BPE and the chat template, no dependencies |
 | `src/arkiv.js` | Saves conversations and metrics to Arkiv (tracker only) |
+| `src/rewards.js`, `src/wallet-auth.js` | Earnings ledger, payouts and withdrawals; linking a phone to its wallet (tracker only) |
+| `chain/` | The PIPER USDC (pUSDC) token contract and its deploy script |
+| `wallet/` | The phone's wallet card (React, Privy), built to `web/dist/` |
 | `web/` | The phone: `index.html` and `app.js` for the UI, `worker.js` runs it in a Web Worker and caches its weights |
 | `web/dashboard.*`, `web/manage.*` | The laptop's demo screen and management view |
 | `web/arkiv.*` | The database peek, on the phone page and at `/arkiv` |
-| `test/check.js` | The checks |
+| `test/check.js`, `test/wallet-check.js` | The checks |
 
 **Joining.** A tab says hello. The tracker gives it a block, and the tab
 downloads that block's weights from `/weights/`. When loaded, it tells the
@@ -256,6 +259,64 @@ laptop, list the tracker's latest add and update transactions with explorer
 links, and the conversations read back from Arkiv itself, so an update shows
 up as a new block height, one more turn and a "just updated" mark.
 
+## Earnings in PIPER USDC
+
+Every phone gets a wallet without signing up, and earns PIPER USDC (pUSDC),
+an ERC-20 on Unichain Sepolia meant to track USDC one to one, for the compute
+it lends. It has USDC's 6 decimals.
+
+The token itself doesn't hold the peg: a pUSDC is worth a dollar only while
+it can be turned into one. Today nothing backs it; see "Not yet".
+
+**Setup, once.**
+
+1. Build the wallet card: `cd swarm && npm run build` (to `web/dist/`).
+2. Create an app at [dashboard.privy.io](https://dashboard.privy.io). Turn on
+   guest accounts, email and SMS login, and add the phone page's origin (your
+   tunnel's `https://` URL; quick-tunnel URLs change on every restart) to the
+   allowed domains. Put its ID in `swarm/.env` as `PRIVY_APP_ID`. Without it,
+   each browser keeps its own key in localStorage instead.
+3. Put a Unichain Sepolia key with a little ETH in `swarm/.env` as
+   `TREASURY_PRIVATE_KEY`, then deploy: `node swarm/chain/deploy.js`. It mints
+   the supply (a million by default, `--supply`) to the treasury and writes
+   the address to `chain/deployment.json`, where the tracker finds it.
+
+Without the treasury key, earnings are still counted, and paid once it is set.
+
+**Wallets.** With Privy, the first visit creates a guest account and its
+embedded wallet, with no questions asked; it stays on that device for 30
+days, and "Sign in with email or phone" makes it permanent with the same
+wallet. The page signs the tracker's per-connection challenge with it
+without a prompt (`src/wallet-auth.js`), so the tracker knows where the
+phone's earnings go and nobody can claim another phone's.
+
+**Earning.** A phone earns `--reward` pUSDC (0.000001, a millionth of a
+dollar) per layer-token: each token it runs through its block, times the
+block's layer-equivalents (`costModel` in `src/blocks.js`, so the block with
+the output projection counts it). A 256-token answer from SmolLM2 is about
+10,000 layer-tokens, so about a cent, shared by the phones on its route.
+Fractions of pUSDC's smallest unit carry over to the next credit, so nothing
+is lost to rounding. What a phone earns before its wallet is linked is kept
+and added when it links. The ledger is `swarm/data/rewards.json`
+(`--ledger`), in pUSDC's base units.
+
+**Payouts.** Every `--payout-every` ms (a minute), the treasury pays every
+wallet with at least `--payout-min` (0.01) pending in one `transferMany`
+transaction (`src/rewards.js`). The transaction is written to the ledger
+before it is waited on; a round left unsettled by a crash is settled from its
+receipt on restart, so nothing is paid twice.
+
+**Withdrawing.** The phone's wallet holds pUSDC but no ETH. It signs an
+ERC-3009 `TransferWithAuthorization` naming the destination and amount
+(Privy shows what is being signed), and the tracker submits it and pays the
+gas. The signature binds the recipient, so the tracker can't redirect it, and
+each one works once. pUSDC also has EIP-2612 `permit`, for the Uniswap pool
+later.
+
+`node test/wallet-check.js [RPC]` checks all of this; with an RPC whose chain
+id is 1301 (a local Hardhat node with `chainId: 1301`), it deploys, pays out,
+withdraws and runs a tracker with three phones.
+
 ## Wire format
 
 Control messages are small JSON: `hello`, `welcome`, `assign`, `ready`, `ask`,
@@ -290,6 +351,8 @@ slower; each phone's page says which kernels it runs.
   the split block's phones reload.
 - Attention, RoPE and SiLU in WASM too; credits (step 5).
 - Direct phone-to-phone WebRTC (after the MVP).
+- Backing pUSDC with USDC, so the peg holds: today it is minted up front and
+  nothing redeems it, and the Uniswap pool isn't built.
 - A cap on KV cache memory per phone. Idle conversations hold theirs until
   New chat or 10 minutes idle; many long conversations on one phone could
   exceed its memory first.

@@ -6,7 +6,7 @@
 //     survives a restart.
 // With a chain (an RPC whose chain id is Unichain Sepolia's 1301, e.g. a
 // local Hardhat node started with chainId 1301):
-//  3. Deploy PIPER; a payout round pays everyone due in one transaction.
+//  3. Deploy PIPER USDC; a payout round pays everyone due in one transaction.
 //  4. A round sent before a crash is settled on restart, never paid twice.
 //  5. Withdrawing with a signed TransferWithAuthorization: it arrives; a
 //     replay, a changed recipient, or someone else's wallet are refused.
@@ -79,11 +79,22 @@ console.log("2. Earnings and the ledger");
   const a = privateKeyToAccount(generatePrivateKey()).address;
   r.credit(a, 8 * 15);    // 8 tokens through a 15-layer block
   r.credit(a, 1 * 15.5);  // fractional layer-equivalents count too
-  const expected = parseUnits("0.1355", 18);
+  const expected = parseUnits("0.1355", 6);
   check("8 tokens x 15 layers + 1 x 15.5 at 0.001 earns 0.1355", BigInt(r.status(a).pending) === expected, r.status(a).pending);
   r.flush();
   const again = createRewards({ file, log: quiet });
   check("the ledger survives a restart", BigInt(again.status(a).pending) === expected && again.status(a).layerTokens === 136);
+
+  // One token at a time through the output block: 7.997 millionths of a
+  // pUSDC each, less than a unit's worth of fraction lost per credit if dropped.
+  const tiny = createRewards({ file: join(tmp, "ledger-2b.json"), rewardPerLayerToken: "0.000001", log: quiet });
+  for (let i = 0; i < 1000; i++) tiny.credit(a, 7.997);
+  check("fractions of a unit carry over: 1000 x 7.997 layer-tokens at 0.000001 pay 7997 units", tiny.status(a).pending === "7997",
+    tiny.status(a).pending);
+
+  writeFileSync(join(tmp, "ledger-18.json"), JSON.stringify({ accounts: { [a]: { pending: "1000000000000000000", paid: "0", layerTokens: 1000 } } }));
+  const old = await refused((async () => createRewards({ file: join(tmp, "ledger-18.json"), log: quiet }))());
+  check("a ledger kept in 18 decimals (the old PIPER) is refused, not read as pUSDC", /18 decimals/.test(old ?? ""), old);
 }
 
 if (!RPC) {
@@ -95,13 +106,13 @@ if (!RPC) {
 
   console.log("3. Deploying and paying out");
   const d = await deploy({ privateKey: TREASURY_KEY, rpcUrl: RPC, supply: "1000000" });
-  check("PIPER deploys with the supply in the treasury", (await balanceOf(d.token, d.treasury)) === parseUnits("1000000", 18), d.token);
+  check("pUSDC deploys with the supply in the treasury", (await balanceOf(d.token, d.treasury)) === parseUnits("1000000", 6), d.token);
   const chain = { privateKey: TREASURY_KEY, rpcUrl: RPC, token: d.token };
   const file = join(tmp, "ledger-3.json");
   const r = createRewards({ file, rewardPerLayerToken: "0.001", payoutMin: "0.01", chain, withdrawEvery: 0, log: quiet });
   await r.init();
   const phones = [0, 1, 2].map(() => privateKeyToAccount(generatePrivateKey()));
-  r.credit(phones[0].address, 1000);  // 1 PIPER
+  r.credit(phones[0].address, 1000);  // 1 pUSDC
   r.credit(phones[1].address, 20);    // 0.02
   r.credit(phones[2].address, 5);     // 0.005: below the minimum, waits
   const before = await pub.getBlockNumber({ cacheTime: 0 });
@@ -109,22 +120,23 @@ if (!RPC) {
   const after = await pub.getBlockNumber({ cacheTime: 0 });
   const balances = await Promise.all(phones.map((p) => balanceOf(d.token, p.address)));
   check("one transaction pays everyone above the minimum",
-    paid.length === 2 && after === before + 1n && balances[0] === parseUnits("1", 18) && balances[1] === parseUnits("0.02", 18) && balances[2] === 0n,
+    paid.length === 2 && after === before + 1n && balances[0] === parseUnits("1", 6) && balances[1] === parseUnits("0.02", 6) && balances[2] === 0n,
     balances.map(String).join(", "));
   check("paid moves out of pending; below the minimum stays pending",
-    r.status(phones[0].address).pending === "0" && r.status(phones[0].address).paid === String(parseUnits("1", 18))
-    && r.status(phones[2].address).pending === String(parseUnits("0.005", 18)));
+    r.status(phones[0].address).pending === "0" && r.status(phones[0].address).paid === String(parseUnits("1", 6))
+    && r.status(phones[2].address).pending === String(parseUnits("0.005", 6)));
   check("the next round has nothing to pay", (await r.payout()).length === 0);
 
   console.log("4. A round in flight across a restart");
   {
     const crashFile = join(tmp, "ledger-4.json");
     const p = privateKeyToAccount(generatePrivateKey()).address;
-    const amount = parseUnits("0.5", 18);
+    const amount = parseUnits("0.5", 6);
     // The treasury sent the round, then the tracker died before settling it.
     const treasury = createWalletClient({ account: privateKeyToAccount(TREASURY_KEY), chain: unichainSepolia, transport });
     const hash = await treasury.writeContract({ address: d.token, abi: TOKEN_ABI, functionName: "transferMany", args: [[p], [amount]] });
     writeFileSync(crashFile, JSON.stringify({
+      decimals: 6,
       accounts: { [p]: { pending: String(amount), paid: "0", layerTokens: 500 } },
       inflight: { hash, amounts: { [p]: String(amount) } },
     }));
@@ -145,22 +157,22 @@ if (!RPC) {
       from: phone.address, to, value, validAfter: 0n, validBefore: BigInt(Math.floor(Date.now() / 1000) + 3600), nonce: `0x${newNonce()}${newNonce()}`,
     });
     const message = (a, signature) => ({ ...a, value: String(a.value), validAfter: "0", validBefore: String(a.validBefore), signature });
-    const a = auth(dest, parseUnits("0.4", 18));
+    const a = auth(dest, parseUnits("0.4", 6));
     const signature = await phone.signTypedData(transferTypedData(token, a));
     const ethBefore = await pub.getBalance({ address: phone.address });
     const hash = await r.withdraw(phone.address, message(a, signature)).catch((err) => err.message);
     check("a signed withdrawal arrives, and the phone's wallet pays no gas",
-      (await balanceOf(d.token, dest)) === parseUnits("0.4", 18) && (await pub.getBalance({ address: phone.address })) === ethBefore && ethBefore === 0n, hash);
-    check("its balance is read again after", r.status(phone.address).balance === String(parseUnits("0.6", 18)));
+      (await balanceOf(d.token, dest)) === parseUnits("0.4", 6) && (await pub.getBalance({ address: phone.address })) === ethBefore && ethBefore === 0n, hash);
+    check("its balance is read again after", r.status(phone.address).balance === String(parseUnits("0.6", 6)));
     const replay = await refused(r.withdraw(phone.address, message(a, signature)));
     check("the same signature again is refused", /already sent/.test(replay ?? ""), replay);
-    const b = auth(dest, parseUnits("0.1", 18));
+    const b = auth(dest, parseUnits("0.1", 6));
     const sigB = await phone.signTypedData(transferTypedData(token, b));
     const redirected = await refused(r.withdraw(phone.address, message({ ...b, to: d.treasury }, sigB)));
     check("changing the recipient breaks the signature", /doesn't match/.test(redirected ?? ""), redirected);
     const notYours = await refused(r.withdraw(phones[1].address, message(b, sigB)));
     check("a phone can't withdraw from another phone's wallet", /only withdraw from this phone's wallet/.test(notYours ?? ""), notYours);
-    const tooMuch = auth(dest, parseUnits("5", 18));
+    const tooMuch = auth(dest, parseUnits("5", 6));
     const sigC = await phone.signTypedData(transferTypedData(token, tooMuch));
     const over = await refused(r.withdraw(phone.address, message(tooMuch, sigC)));
     check("more than the balance is refused before anything is sent", /not that much/.test(over ?? ""), over);
@@ -176,7 +188,7 @@ async function trackerCheck(token) {
   const ledger = join(tmp, "ledger-6.json");
   const tracker = spawn(process.execPath, [
     join(ROOT, "swarm", "tracker.js"), "--port", String(port), "--host", "127.0.0.1", "--min-replica", "1",
-    "--payout-every", "1000", "--payout-min", "0.0001", "--ledger", ledger,
+    "--payout-every", "1000", "--payout-min", "0.0001", "--reward", "0.001", "--ledger", ledger,
   ], { env: { ...process.env, TREASURY_PRIVATE_KEY: TREASURY_KEY, PIPER_TOKEN: token, CHAIN_RPC_URL: RPC, PRIVY_APP_ID: "", ARKIV_PRIVATE_KEY: "" }, stdio: ["ignore", "pipe", "pipe"] });
   let out = "";
   tracker.stdout.on("data", (b) => (out += b));
@@ -185,8 +197,10 @@ async function trackerCheck(token) {
   try {
     await until(() => out.includes("Tracker listening"), 15000);
     const config = await (await fetch(`${server}/wallet/config`)).json();
-    check("/wallet/config gives the token and its EIP-712 domain",
-      config.payouts && config.token?.address.toLowerCase() === token.toLowerCase() && config.token.version === "1" && config.token.chainId === 1301);
+    check("/wallet/config gives the token, PIPER USDC with USDC's 6 decimals, and its EIP-712 domain",
+      config.payouts && config.token?.address.toLowerCase() === token.toLowerCase() && config.token.name === "PIPER USDC"
+      && config.token.symbol === "pUSDC" && config.token.decimals === 6 && config.token.version === "1" && config.token.chainId === 1301,
+      `${config.token?.name} (${config.token?.symbol}), ${config.token?.decimals} decimals`);
 
     const events = [];
     for (let i = 0; i < 3; i++) {
@@ -224,9 +238,11 @@ async function trackerCheck(token) {
       paid && onChain.every((b, i) => String(b) === status(i).balance), onChain.map(String).join(", "));
     // Every phone ran the same tokens, so earnings go by the block's layer-equivalents.
     const cost = costModel(JSON.parse(readFileSync(join(ROOT, "weights", "smollm2-135m-instruct", "manifest.json"), "utf8")));
-    const perLayer = onChain.map((b, i) => Number(b) / cost(peers[i].block));
-    check("phones earn by their block's compute", perLayer.every((x) => Math.abs(x / perLayer[0] - 1) < 1e-6),
-      peers.map((p, i) => `${p.id} ${cost(p.block).toFixed(2)} layers: ${Number(onChain[i]) / 1e18}`).join(", "));
+    // A's block is whole layers, so its earnings are exact; the others may still carry under one unit.
+    const a0 = peers.findIndex((p) => Number.isInteger(cost(p.block)));
+    const perLayer = Number(onChain[a0]) / cost(peers[a0].block);
+    check("phones earn by their block's compute", onChain.every((b, i) => Math.abs(Number(b) - perLayer * cost(peers[i].block)) < 1),
+      peers.map((p, i) => `${p.id} ${cost(p.block).toFixed(2)} layers: ${Number(onChain[i]) / 1e6}`).join(", "));
 
     const dest = privateKeyToAccount(generatePrivateKey()).address;
     const balance = BigInt(status(2).balance);

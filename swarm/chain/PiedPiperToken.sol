@@ -5,8 +5,9 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
 import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 
-/// Pied Piper's compute token. The whole supply is minted once, to the
-/// treasury that pays phones for the blocks they serve.
+/// PIPER USDC (pUSDC): what phones are paid in for the blocks they serve,
+/// meant to track USDC one to one, so it has USDC's 6 decimals. The whole
+/// supply is minted once, to the treasury that pays phones.
 ///
 /// On top of ERC-20 and EIP-2612 permit it has ERC-3009's
 /// transferWithAuthorization: a phone's wallet holds no ETH, so it withdraws
@@ -29,10 +30,14 @@ contract PiedPiperToken is ERC20, ERC20Permit {
     error LengthMismatch();
 
     constructor(address treasury, uint256 supply)
-        ERC20("Pied Piper Compute", "PIPER")
-        ERC20Permit("Pied Piper Compute")
+        ERC20("PIPER USDC", "pUSDC")
+        ERC20Permit("PIPER USDC")
     {
         _mint(treasury, supply);
+    }
+
+    function decimals() public pure override returns (uint8) {
+        return 6;
     }
 
     function transferMany(address[] calldata to, uint256[] calldata amounts) external {

@@ -9,8 +9,8 @@ export function Earnings({ ctx, address, sign, problem = null, account }) {
   const { config, store } = ctx;
   const { status, error } = useSyncExternalStore(store.subscribe, store.get);
   const token = config.token;
-  const symbol = token?.symbol ?? "PIPER";
-  const decimals = token?.decimals ?? 18;
+  const symbol = token?.symbol ?? "pUSDC";
+  const decimals = token?.decimals ?? 6;
   const amount = (wei) => trim(formatUnits(BigInt(wei), decimals));
   const linked = !!(status?.address && address && getAddress(status.address) === getAddress(address));
   const balance = linked && status.balance != null ? BigInt(status.balance) : 0n;
@@ -105,9 +105,9 @@ function randomNonce() {
 
 const short = (hex) => `${hex.slice(0, 6)}…${hex.slice(-4)}`;
 
-// At most 4 decimals, no trailing zeros.
+// At most 6 decimals (USDC's, so a phone's first cents show), no trailing zeros.
 function trim(s) {
   const [whole, frac = ""] = s.split(".");
-  const f = frac.slice(0, 4).replace(/0+$/, "");
+  const f = frac.slice(0, 6).replace(/0+$/, "");
   return f ? `${whole}.${f}` : whole;
 }

@@ -1,17 +1,19 @@
-// What phones earn for the blocks they serve, and paying it out in PIPER on
-// Unichain Sepolia (chain/PiedPiperToken.sol).
+// What phones earn for the blocks they serve, and paying it out in PIPER USDC
+// (pUSDC, 6 decimals) on Unichain Sepolia (chain/PiedPiperToken.sol).
 //
 // Earnings are counted in layer-tokens: a phone that runs n tokens through a
 // block of c layer-equivalents (blocks.js costModel) does n * c of them. They
-// go to the phone's wallet address as pending; every payout round, the
-// treasury sends everything pending above the minimum in one transferMany
-// transaction. The ledger lives in a JSON file, so a restart loses nothing.
+// go to the phone's wallet address as pending, in the token's base units; the
+// fraction of a unit left over is carried to the next credit, so tiny
+// rewards add up exactly. Every payout round, the treasury sends everything
+// pending above the minimum in one transferMany transaction. The ledger lives
+// in a JSON file, so a restart loses nothing.
 //
 // A round's transaction is written to the ledger before it is waited on.
 // Until it is settled, no other round starts; after a crash it is looked up
 // again, so a round is never paid twice.
 //
-// Withdrawing: the phone's wallet holds PIPER but no ETH, so it signs an
+// Withdrawing: the phone's wallet holds pUSDC but no ETH, so it signs an
 // ERC-3009 TransferWithAuthorization to its own destination, and the
 // treasury submits it and pays the gas.
 
@@ -43,23 +45,24 @@ const WITHDRAW_ERRORS = {
   AuthorizationExpired: "the signature expired; withdraw again",
   AuthorizationNotYetValid: "the signature isn't valid yet",
   InvalidAuthorizationSignature: "the signature doesn't match this withdrawal",
-  ERC20InsufficientBalance: "not that much PIPER in this wallet",
+  ERC20InsufficientBalance: "not that much pUSDC in this wallet",
 };
 
 const PER_ROUND = 200;          // recipients per transferMany
 const SCALE = 1_000_000n;       // layer-tokens are fractional; count them in millionths
 
 // chain: { privateKey, rpcUrl, token } to pay out, or null to only count.
+// decimals: the token's; the ledger counts in its base units.
 // withdrawEvery: ms a wallet waits between withdrawals, since the treasury pays their gas.
 export function createRewards({
-  file, rewardPerLayerToken = "0.001", payoutMin = "0.01", chain = null, withdrawEvery = 30000, log = console.log,
+  file, rewardPerLayerToken = "0.000001", payoutMin = "0.01", decimals = 6, chain = null, withdrawEvery = 30000, log = console.log,
 }) {
-  const reward = parseUnits(rewardPerLayerToken, 18);
-  const ledger = load(file);
+  const reward = parseUnits(rewardPerLayerToken, decimals);
+  const min = parseUnits(payoutMin, decimals);
+  const ledger = load(file, decimals);
   const balances = new Map(); // address -> on-chain balance, as last read
   const lastWithdraw = new Map();
   let token = null;           // { address, name, symbol, decimals, version, chainId }
-  let min = parseUnits(payoutMin, 18);
   let paying = false;
   let saveTimer = null;
 
@@ -68,7 +71,8 @@ export function createRewards({
   const pub = chain ? createPublicClient({ chain: unichainSepolia, transport }) : null;
   const wallet = chain ? createWalletClient({ account, chain: unichainSepolia, transport }) : null;
 
-  const entry = (address) => (ledger.accounts[address] ??= { pending: "0", paid: "0", layerTokens: 0 });
+  // carry: millionths of a base unit earned but not yet a whole unit.
+  const entry = (address) => (ledger.accounts[address] ??= { pending: "0", paid: "0", carry: "0", layerTokens: 0 });
 
   function save(now = false) {
     clearTimeout(saveTimer);
@@ -87,19 +91,20 @@ export function createRewards({
   async function init() {
     if (!chain) return;
     const read = (functionName, args = []) => pub.readContract({ address: chain.token, abi: TOKEN_ABI, functionName, args });
-    const [name, symbol, decimals, domain, chainId] = await Promise.all([
+    const [name, symbol, tokenDecimals, domain, chainId] = await Promise.all([
       read("name"), read("symbol"), read("decimals"), read("eip712Domain"), pub.getChainId(),
     ]);
+    if (tokenDecimals !== decimals) throw new Error(`${symbol} has ${tokenDecimals} decimals; the ledger counts in ${decimals}`);
     token = { address: getAddress(chain.token), name, symbol, decimals, version: domain[2], chainId };
-    min = parseUnits(payoutMin, decimals);
     if (ledger.inflight) await settle();
   }
 
   function credit(address, layerTokens) {
     if (!(layerTokens > 0)) return;
     const e = entry(address);
-    const amount = (BigInt(Math.round(layerTokens * Number(SCALE))) * reward) / SCALE;
-    e.pending = String(BigInt(e.pending) + amount);
+    const owed = BigInt(e.carry ?? "0") + BigInt(Math.round(layerTokens * Number(SCALE))) * reward;
+    e.pending = String(BigInt(e.pending) + owed / SCALE);
+    e.carry = String(owed % SCALE);
     e.layerTokens += layerTokens;
     save();
   }
@@ -114,7 +119,7 @@ export function createRewards({
     try {
       balances.set(address, String(await pub.readContract({ address: token.address, abi: TOKEN_ABI, functionName: "balanceOf", args: [address] })));
     } catch (err) {
-      log(`reading the PIPER balance of ${address} failed: ${err.shortMessage ?? err.message}`);
+      log(`reading the ${token.symbol} balance of ${address} failed: ${err.shortMessage ?? err.message}`);
     }
     return status(address);
   }
@@ -205,7 +210,7 @@ export function createRewards({
     return hash;
   }
 
-  const fmt = (wei) => formatUnits(wei, token?.decimals ?? 18);
+  const fmt = (units) => formatUnits(units, decimals);
 
   function info() {
     return {
@@ -221,12 +226,17 @@ export function createRewards({
   return { init, credit, status, refresh, payout, withdraw, info, flush: () => save(true) };
 }
 
-function load(file) {
+// A ledger kept in other units (the 18-decimal PIPER) is refused, not misread.
+function load(file, decimals) {
+  let ledger;
   try {
-    const ledger = JSON.parse(readFileSync(file, "utf8"));
-    return { accounts: ledger.accounts ?? {}, inflight: ledger.inflight ?? null };
+    ledger = JSON.parse(readFileSync(file, "utf8"));
   } catch (err) {
     if (err.code !== "ENOENT") throw new Error(`cannot read the rewards ledger ${file}: ${err.message}`);
-    return { accounts: {}, inflight: null };
+    return { decimals, accounts: {}, inflight: null };
   }
+  if ((ledger.decimals ?? 18) !== decimals) {
+    throw new Error(`the rewards ledger ${file} counts in ${ledger.decimals ?? 18} decimals, not ${decimals}; move it away to start a new one`);
+  }
+  return { decimals, accounts: ledger.accounts ?? {}, inflight: ledger.inflight ?? null };
 }

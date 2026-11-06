@@ -3,7 +3,7 @@
 // the gas. Writes the token's address to chain/deployment.json, where the
 // tracker finds it.
 //
-//   node swarm/chain/deploy.js [--supply 1000000000] [--rpc URL] [--force]
+//   node swarm/chain/deploy.js [--supply 1000000] [--rpc URL] [--force]
 //
 // The chain is Unichain Sepolia; --rpc points at another node of it (or at a
 // local test chain, for tests). --force deploys again over an existing
@@ -54,7 +54,7 @@ export async function deploy({ privateKey, rpcUrl, supply, chain = unichainSepol
   const transport = http(rpcUrl);
   const pub = createPublicClient({ chain, transport });
   const wallet = createWalletClient({ account, chain, transport });
-  const hash = await wallet.deployContract({ abi, bytecode, args: [account.address, parseUnits(String(supply), 18)] });
+  const hash = await wallet.deployContract({ abi, bytecode, args: [account.address, parseUnits(String(supply), 6)] });
   const receipt = await pub.waitForTransactionReceipt({ hash });
   if (receipt.status !== "success") throw new Error(`deploy transaction ${hash} reverted`);
   return { chainId: chain.id, token: receipt.contractAddress, treasury: account.address, txHash: hash, block: Number(receipt.blockNumber), supply: String(supply) };
@@ -62,7 +62,7 @@ export async function deploy({ privateKey, rpcUrl, supply, chain = unichainSepol
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const { values: opts } = parseArgs({
-    options: { supply: { type: "string", default: "1000000000" }, rpc: { type: "string" }, force: { type: "boolean", default: false } },
+    options: { supply: { type: "string", default: "1000000" }, rpc: { type: "string" }, force: { type: "boolean", default: false } },
   });
   try {
     process.loadEnvFile(join(HERE, "..", ".env"));
@@ -80,7 +80,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const d = await deploy({ privateKey, rpcUrl, supply: opts.supply });
   writeFileSync(DEPLOYMENT, JSON.stringify(d, null, 2) + "\n");
   const explorer = unichainSepolia.blockExplorers.default.url;
-  console.log(`PIPER deployed at ${d.token}, ${d.supply} minted to the treasury ${d.treasury}`);
+  console.log(`PIPER USDC (pUSDC) deployed at ${d.token}, ${d.supply} minted to the treasury ${d.treasury}`);
   console.log(`  ${explorer}/address/${d.token}`);
   console.log(`  written to ${DEPLOYMENT}`);
 }

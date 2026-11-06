@@ -31,6 +31,7 @@
 
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket as RawSocket } from "ws";
@@ -128,38 +129,47 @@ console.log("2. Frames");
 }
 
 console.log("3. Where phones go");
+// Phones joining one at a time, placed as the tracker places them (the pure
+// functions in src/blocks.js): a split gives the first half minReplica of
+// the old holders and the second half the rest plus the joining phone.
+// onJoin sees the blocks and holder counts after each join.
+function simulateJoins(manifest, minBlocks, minReplica, n, onJoin = () => {}) {
+  const cost = costModel(manifest);
+  const cut = initialCut(manifest, minBlocks);
+  const blocks = cut.slice(0, -1).map((start, i) => ({ start, end: cut[i + 1] }));
+  const holders = blocks.map(() => 0);
+  for (let k = 0; k < n; k++) {
+    const place = placeJoin(blocks, holders, { minReplica, cost });
+    if (place.split === undefined) holders[place.block]++;
+    else {
+      const b = blocks[place.split], m = splitPoint(b, cost);
+      blocks.splice(place.split, 1, { start: b.start, end: m }, { start: m, end: b.end });
+      holders.splice(place.split, 1, minReplica, holders[place.split] + 1 - minReplica);
+    }
+    onJoin(blocks, holders, place);
+  }
+  return { blocks, holders };
+}
+// What Stage.describe() says for a block of the model under test.
+function describeBlock({ start, end }) {
+  const parts = start === 0 ? ["embedding"] : [];
+  parts.push(end - 1 > start ? `layers ${start}–${end - 1}` : `layer ${start}`);
+  if (end === manifest.config.num_layers) parts.push("output");
+  return parts.join(" + ");
+}
 // The tracker's first cut of the model under test, and its blocks' names.
 const BOUNDARIES = initialCut(manifest, 3);
-const BLOCK_NAMES = [0, 1, 2].map((i) => {
-  const [s, e] = [BOUNDARIES[i], BOUNDARIES[i + 1]];
-  const parts = s === 0 ? ["embedding"] : [];
-  parts.push(e - 1 > s ? `layers ${s}–${e - 1}` : `layer ${s}`);
-  if (e === manifest.config.num_layers) parts.push("output");
-  return parts.join(" + ");
-});
+const BLOCK_NAMES = [0, 1, 2].map((i) => describeBlock({ start: BOUNDARIES[i], end: BOUNDARIES[i + 1] }));
 {
   const manifest = SMOLLM2;
   const BOUNDARIES = [0, 8, 23, 30];
   const cost = costModel(manifest);
   const L = manifest.config.num_layers;
-  // Phones join one at a time, as the tracker places them; a split gives the
-  // first half minReplica of the old holders and the second half the rest
-  // plus the joining phone. Returns the layout after each join.
+  // The layout after each of n joins.
   const join = (minBlocks, minReplica, n) => {
-    const cut = initialCut(manifest, minBlocks);
-    const blocks = cut.slice(0, -1).map((start, i) => ({ start, end: cut[i + 1] }));
-    const holders = blocks.map(() => 0);
     const layouts = [];
-    for (let k = 0; k < n; k++) {
-      const place = placeJoin(blocks, holders, { minReplica, cost });
-      if (place.split === undefined) holders[place.block]++;
-      else {
-        const b = blocks[place.split], m = splitPoint(b, cost);
-        blocks.splice(place.split, 1, { start: b.start, end: m }, { start: m, end: b.end });
-        holders.splice(place.split, 1, minReplica, holders[place.split] + 1 - minReplica);
-      }
-      layouts.push(blocks.map((b, i) => `${b.start}-${b.end}${b.end === L ? "+out" : ""}×${holders[i]}`).join(" "));
-    }
+    simulateJoins(manifest, minBlocks, minReplica, n, (blocks, holders) =>
+      layouts.push(blocks.map((b, i) => `${b.start}-${b.end}${b.end === L ? "+out" : ""}×${holders[i]}`).join(" ")));
     return layouts;
   };
   check("the first cut balances memory: SmolLM2-135M's 3 blocks are 0, 8, 23, 30", same(initialCut(manifest, 3), BOUNDARIES),
@@ -229,8 +239,10 @@ const conversation = { ids: [], answers: [] };
 // pings from JS, and the reference work in this process can hold it for a
 // few seconds. (A browser answers pings outside the page's JS.)
 const HEARTBEAT_MS = 8000;
+// The rewards ledger goes to a scratch file: the checks never touch the real one.
 const tracker = spawn(process.execPath, [join(ROOT, "swarm", "tracker.js"), "--port", "0", "--host", "127.0.0.1", "--weights", WEIGHTS,
-  "--heartbeat-timeout", String(HEARTBEAT_MS)], { stdio: ["ignore", "pipe", "inherit"] });
+  "--heartbeat-timeout", String(HEARTBEAT_MS), "--ledger", join(tmpdir(), `swarm-check-rewards-${process.pid}.json`)],
+  { stdio: ["ignore", "pipe", "inherit"] });
 const trackerLog = [];
 const server = await new Promise((resolve, reject) => {
   tracker.on("exit", (code) => reject(new Error(`tracker exited with ${code}`)));
@@ -301,15 +313,17 @@ for (let i = 1; i < 6; i++) phones.push(await startPeer());
 console.log("6. One answer through the swarm");
 let asker = phones[0];
 let mainSession = null;
+let msPerToken = 0; // through the swarm, measured here; check 9 scales its slowdown by it
 {
   const steps = await collect(asker.ask(prompt, { maxNew: greedy.length, stopIds: [EOS] }));
   mainSession = steps[0].session;
   const tokens = steps.map((x) => x.token);
   const matched = tokens.filter((t, i) => t === greedy[i]).length;
   const perToken = steps.slice(1).reduce((sum, x) => sum + x.ms, 0) / (steps.length - 1);
+  msPerToken = perToken;
   check(`greedy tokens equal ${REFERENCE}`, same(tokens, greedy),
     `${matched} of ${greedy.length}, route ${steps[0].route.join(" → ")}, first token ${(steps[0].ms / 1000).toFixed(1)} s, then ${perToken.toFixed(0)} ms per token`);
-  check("the text matches", tok.decode(tokens) === index.greedy_text);
+  check("the text matches", tok.decode(tokens, { skipSpecial: true }) === index.greedy_text);
 }
 
 console.log("7. h on the wire vs step 2 in one process");
@@ -345,12 +359,14 @@ console.log("8. Two askers at once");
 
 console.log("9. Speed-aware routing");
 {
-  // One block-2 phone gets 150 ms slower per frame. Two questions at once put
-  // it on one of the routes, so the tracker measures it.
+  // One block-2 phone gets slower per frame: 150 ms, or several tokens'
+  // worth for a big model, so it is clearly the slow one. Two questions at
+  // once put it on one of the routes, so the tracker measures it.
+  const SLOW_MS = Math.max(150, Math.round(7 * msPerToken));
   const [slow, fast] = phones.filter((p) => p.block.index === 1);
   const original = slow.stage.forwardAsync;
   slow.stage.forwardAsync = async function (...args) {
-    await wait(150);
+    await wait(SLOW_MS);
     return original.apply(this, args);
   };
   const both = await Promise.all([
@@ -520,19 +536,27 @@ console.log("14. Rebalancing live");
   const layout = () => watch.state.blocks.map((b) => `${b.start}-${b.end}×${watch.state.peers.filter((p) => p.block === b.index).length}`).join(" ");
   const settled = () => until(() => watch.state.peers.length === phones.length && watch.state.peers.every((p) => p.ready), 10000);
   const LONG = 30;
+  // What the tracker should do, from the same placement rules on this
+  // model's blocks: the layout after n phones have joined from scratch.
+  const expected = (n) => {
+    const { blocks, holders } = simulateJoins(manifest, 3, 2, n);
+    return { blocks, holders, layout: blocks.map((b, i) => `${b.start}-${b.end}×${holders[i]}`).join(" ") };
+  };
   await settled();
   const start = layout();
+  const have = phones.length;
   for (let i = 0; i < 3; i++) phones.push(await startPeer());
   await settled();
-  check("new phones fill every block up to min_replica first", layout() === "0-8×2 8-23×2 23-30×2", `${start} → ${layout()}`);
+  check("new phones fill every block up to min_replica first", layout() === expected(have + 3).layout, `${start} → ${layout()}`);
 
   phones.push(await startPeer());
   await settled();
+  const largest = expected(have + 4).holders.indexOf(3);
   check("the next one joins the block with the most compute as an extra replica",
-    layout() === "0-8×2 8-23×3 23-30×2", `${phones.at(-1).id} on block 2: ${layout()}`);
+    layout() === expected(have + 4).layout, `${phones.at(-1).id} on block ${largest + 1}: ${layout()}`);
 
-  // The phone after that splits block 2, while an answer is going through it.
-  const old = watch.state.peers.filter((p) => p.block === 1).sort((a, b) => a.joinedAt - b.joinedAt).map((p) => phones.find((x) => x.id === p.id));
+  // The phone after that splits that block, while an answer is going through it.
+  const old = watch.state.peers.filter((p) => p.block === largest).sort((a, b) => a.joinedAt - b.joinedAt).map((p) => phones.find((x) => x.id === p.id));
   let joining = null;
   const mark = trackerLog.length;
   const steps = await collect(asker.ask(prompt, { maxNew: LONG, stopIds: [EOS] }), (step, count) => {
@@ -542,34 +566,40 @@ console.log("14. Rebalancing live");
   phones.push(splitter);
   await settled();
   const last = steps.at(-1);
+  const split = expected(have + 5);
   check("the phone that brings it to 2 × min_replica splits it in the middle of an answer, and the answer is still exactly right",
-    same(steps.map((x) => x.token), greedy.slice(0, LONG)) && last.route.length === 4 && last.reroutes === 0 && layout() === "0-8×2 8-15×2 15-23×2 23-30×2",
+    same(steps.map((x) => x.token), greedy.slice(0, LONG)) && last.route.length === 4 && last.reroutes === 0 && layout() === split.layout,
     `${steps[1].route.join(" → ")} became ${last.route.join(" → ")}; ${trackerLog.slice(mark).find((e) => /splits/.test(e))?.slice(9)}`);
   const halves = [old[0], old[1], old[2], splitter].map((p) => p.stage.describe());
+  const [first, second] = [split.blocks[largest], split.blocks[largest + 1]].map(describeBlock);
   check("its two earliest phones take the first half; the third and the new phone the second; each holds only its half",
-    same(halves, ["layers 8–14", "layers 8–14", "layers 15–22", "layers 15–22"]),
+    same(halves, [first, first, second, second]),
     [old[0], old[1], old[2], splitter].map((p, i) => `${p.id} ${halves[i]}`).join(", "));
   const after = await collect(asker.ask(otherPrompt, { maxNew: SHORT, stopIds: [EOS] }));
   check("a new question through the four blocks is right too", same(after.map((x) => x.token), reference.otherTokens), after[0].route.join(" → "));
 
-  // One more phone makes block 4 the one with a spare. A phone of block 1
-  // leaving leaves it below min_replica, so the spare moves there.
+  // One more phone gives the block with the most compute a spare. A phone of
+  // another block leaving leaves that block below min_replica, so the spare
+  // moves there.
   phones.push(await startPeer());
   await settled();
   const spare = layout();
-  const leaver = phones.find((p) => p.block.start === 0 && p !== asker);
+  const withSpare = expected(have + 6);
+  const spareBlock = withSpare.holders.indexOf(3);
+  const short = withSpare.blocks.findIndex((b, i) => i !== spareBlock && withSpare.holders[i] === 2);
+  const leaver = phones.find((p) => p.block.index === short && p !== asker);
   const mark2 = trackerLog.length;
   leaver.close();
   phones.splice(phones.indexOf(leaver), 1);
   await until(() => !listed(leaver.id));
   await settled();
-  const moved = trackerLog.slice(mark2).find((e) => /moves to block 1/.test(e));
+  const moved = trackerLog.slice(mark2).find((e) => new RegExp(`moves to block ${short + 1} `).test(e));
   const movedPhone = phones.find((p) => moved?.includes(` ${p.id} moves`));
   const answer = await collect(asker.ask(prompt, { maxNew: SHORT, stopIds: [EOS] }));
   check("when a block falls below min_replica, a phone moves to it from a block with more than min_replica",
-    spare === "0-8×2 8-15×2 15-23×2 23-30×3" && layout() === "0-8×2 8-15×2 15-23×2 23-30×2" &&
-    movedPhone?.stage.describe() === BLOCK_NAMES[0] && same(answer.map((x) => x.token), greedy.slice(0, SHORT)),
-    `${spare}; ${leaver.id} left; ${moved?.slice(9) ?? "nobody moved"}`);
+    spare === withSpare.layout && layout() === split.layout &&
+    movedPhone?.stage.describe() === describeBlock(withSpare.blocks[short]) && same(answer.map((x) => x.token), greedy.slice(0, SHORT)),
+    `${spare}; ${leaver.id} left block ${short + 1}; ${moved?.slice(9) ?? "nobody moved"}`);
 }
 
 console.log("15. What phones and the dashboard get");

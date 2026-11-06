@@ -34,22 +34,21 @@ const peer = new Peer({
 });
 await peer.connect();
 const tok = await peer.loadTokenizer();
-const EOS = tok.eosId;
+const STOP = new Set(tok.stopIds); // <|im_end|>, and the model's own end tokens
 
 // Harnesses resend the whole conversation every turn. The phones on the
 // route keep the KV cache between turns (peer.ask with keep), so when a
-// request extends the previous conversation only its new turns are sent,
-// built the way the phone page builds them (web/worker.js): the previous
-// ids, which end with <|im_end|>, then the new turns.
+// request is the previous conversation plus one question, only that question
+// is sent, built the way the phone page builds it (web/worker.js): the
+// previous ids, which end with <|im_end|>, then the new turn.
 let last = null; // { messages, ids }: the previous conversation, answer included
 
 function promptIds(messages) {
   const n = last?.messages.length ?? 0;
-  const extended = n > 0 && messages.length > n
+  const extended = n > 0 && messages.length === n + 1 && messages[n].role === "user"
     && last.messages.every((m, i) => m.role === messages[i].role && m.content === messages[i].content);
   if (!extended) return tok.chat(messages);
-  const turns = messages.slice(n).map((m) => `<|im_start|>${m.role}\n${m.content}<|im_end|>\n`).join("");
-  return [...last.ids, ...tok.encode(`\n${turns}<|im_start|>assistant\n`)];
+  return [...last.ids, ...tok.encode(tok.turnText(messages[n].content))];
 }
 
 // OpenAI messages -> the roles the chat template knows, with string content.
@@ -93,22 +92,26 @@ async function chatCompletion(req, res) {
       choices: delta ? [{ index: 0, delta, finish_reason }] : [], ...extra })}\n\n`);
   let gone = false; // the harness hung up mid-answer
   res.on("close", () => { if (!res.writableFinished) gone = true; });
-  if (body.stream) {
-    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-    chunk({ role: "assistant", content: "" });
-  }
 
   const ids = promptIds(messages);
   const decoder = tok.streamDecoder();
   const answer = [];
   let text = "", finish = "length", cached = 0, route = null, firstMs = 0;
   const t0 = performance.now();
+  const steps = peer.ask(ids, { maxNew, stopIds: tok.stopIds, keep: true });
   try {
-    for await (const step of peer.ask(ids, { maxNew, stopIds: [EOS], keep: true })) {
-      if (gone) break; // stop asking the swarm; the next ask ends the kept session
+    // The first step is where the tracker grants the session or refuses, so
+    // a refusal is a 503 rather than an error inside a 200 stream.
+    let r = await steps.next();
+    if (body.stream) {
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+      chunk({ role: "assistant", content: "" });
+    }
+    for (; !r.done && !gone; r = await steps.next()) {
+      const step = r.value;
       ({ cached, route } = step);
       if (!answer.length) firstMs = step.ms;
-      if (step.token === EOS) {
+      if (STOP.has(step.token)) {
         finish = "stop";
         break;
       }
@@ -117,6 +120,7 @@ async function chatCompletion(req, res) {
       text += piece;
       if (body.stream && piece) chunk({ content: piece });
     }
+    if (!r.done) await steps.return(); // stopped early: the session is kept, as after a full answer
     text += decoder.flush();
   } catch (err) {
     last = null;
@@ -125,7 +129,7 @@ async function chatCompletion(req, res) {
     res.write(`data: ${JSON.stringify(errorBody(err.message, "server_error"))}\n\n`);
     return res.end();
   }
-  last = gone ? null : { messages: [...messages, { role: "assistant", content: text }], ids: [...ids, ...answer, EOS] };
+  last = gone ? null : { messages: [...messages, { role: "assistant", content: text }], ids: [...ids, ...answer, tok.eosId] };
   const perToken = answer.length > 1 ? `${((performance.now() - t0 - firstMs) / (answer.length - 1)).toFixed(0)} ms per token` : "";
   console.log(`${time()} ${answer.length} tokens via ${route?.join(" → ") ?? "?"} · prompt ${ids.length} tokens, ${cached} cached`
     + ` · first token ${(firstMs / 1000).toFixed(1)} s${perToken ? `, then ${perToken}` : ""} · ${gone ? "client hung up" : finish}`);

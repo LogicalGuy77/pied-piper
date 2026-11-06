@@ -24,11 +24,11 @@
 //
 // Rewards: every phone gets a wallet with no sign-up (a Privy guest wallet,
 // with PRIVY_APP_ID; otherwise one kept in the browser), proves it holds it
-// by signing a challenge (src/wallet-auth.js), and earns PIPER for
+// by signing a challenge (src/wallet-auth.js), and earns PIPER USDC for
 // the layer-tokens it serves (src/rewards.js). With TREASURY_PRIVATE_KEY and
 // a deployed token (chain/deploy.js), the treasury pays out on Unichain
 // Sepolia every --payout-every ms, and submits withdrawals for phones.
-//   [--reward 0.001] PIPER per layer-token   [--payout-min 0.01]   [--payout-every 60000]
+//   [--reward 0.000001] pUSDC per layer-token   [--payout-min 0.01]   [--payout-every 60000]
 
 import { createHash } from "node:crypto";
 import { createReadStream, readdirSync, readFileSync, statSync } from "node:fs";
@@ -66,7 +66,7 @@ const { values: opts } = parseArgs({
     "heartbeat-timeout": { type: "string", default: "5000" },
     "busy-timeout": { type: "string", default: "20000" },
     "session-idle": { type: "string", default: "600000" },
-    reward: { type: "string", default: "0.001" },
+    reward: { type: "string", default: "0.000001" },
     "payout-min": { type: "string", default: "0.01" },
     "payout-every": { type: "string", default: "60000" },
     ledger: { type: "string", default: join(ROOT, "swarm", "data", "rewards.json") },
@@ -540,6 +540,7 @@ function changed() {
 
 function onControl(peer, msg) {
   if (msg.type === "ready") {
+    if (!peer.block) return; // a client serves nothing
     if (msg.block !== undefined && msg.block !== peer.block.id) return; // loaded a block it has since been moved off
     peer.ready = true;
     log(`${peer.id} ready with block ${peer.block.index + 1}`);
@@ -878,6 +879,6 @@ server.listen(Number(opts.port), opts.host, () => {
   console.log(arkiv ? `  arkiv: saving conversations as ${arkiv.address} on Rabdi, see ${scheme}://localhost:${port}/arkiv` : `  ${ARKIV_OFF}`);
   console.log(`  wallets: ${PRIVY_APP_ID ? `Privy app ${PRIVY_APP_ID}` : "kept in each browser (set PRIVY_APP_ID for Privy guest wallets)"}`);
   console.log(treasuryKey && tokenAddress
-    ? `  rewards: ${opts.reward} PIPER per layer-token, paid from the treasury every ${secs(Number(opts["payout-every"]))}, token ${tokenAddress}`
+    ? `  rewards: ${opts.reward} pUSDC per layer-token, paid from the treasury every ${secs(Number(opts["payout-every"]))}, token ${tokenAddress}`
     : `  rewards: counted in ${opts.ledger}; payouts off: ${PAYOUTS_OFF}`);
 });
